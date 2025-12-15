@@ -1,38 +1,29 @@
 import React, { useRef, useEffect, useState } from 'react';
-import { FilterState, ProcessingMode, ExportConfig, AnalysisResult } from './types';
-import { Upload, Play, Pause, Download, Wand2, Loader2, Undo2, Volume2, VolumeX, MonitorPlay, X, AlertCircle, ScanFace, User, Eraser, Sun, Leaf, FileVideo, CheckCircle2, Smile, Feather, Power, Activity } from 'lucide-react';
-import { analyzeFrame } from './services/geminiService';
-
-interface VideoFormat {
-  mime: string;
-  label: string;
-  ext: string;
-}
+import { FilterState, ProcessingMode, ExportConfig } from './types';
+import { Upload, Play, Pause, Download, Loader2, Undo2, Volume2, VolumeX, AlertCircle, X, CheckCircle2, ZoomIn, ZoomOut, RotateCcw, Move, Wand2, Sparkles, ChevronDown, MonitorPlay, SplitSquareHorizontal, Eye } from 'lucide-react';
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 type AppStep = 'upload' | 'original' | 'enhanced';
+type ResolutionOption = 'original' | '1080p' | '2k' | '4k';
 
 const App: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const exportCanvasRef = useRef<HTMLCanvasElement>(null);
-  
-  // OPTIMIZATION: Offscreen canvas for fast blur/retouching calculations
   const tempCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   
   // State Refs for Render Loop
-  const filtersRef = useRef<FilterState>({ brightness: 100, contrast: 100, saturation: 100, sharpen: 0, denoise: 40, warmth: 100 });
-  const vignetteRef = useRef<number>(0);
-  const isUpscaledRef = useRef<boolean>(false);
   const stepRef = useRef<AppStep>('upload');
+  const isEnhancedRef = useRef<boolean>(false);
+  const isComparingRef = useRef<boolean>(false); // Ref for immediate render loop access
+  const isExportingRef = useRef<boolean>(false);
   
-  // Feature Mode Refs
-  const isSmoothModeRef = useRef<boolean>(false);
-  const isEffectEnabledRef = useRef<boolean>(true);
-
-  // Compare Mode Ref
-  const isCompareActiveRef = useRef<boolean>(false);
+  // Zoom & Pan Refs
+  const zoomRef = useRef<number>(1);
+  const panRef = useRef<{x: number, y: number}>({ x: 0, y: 0 });
   
   // Audio Context Refs
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -44,37 +35,31 @@ const App: React.FC = () => {
   
   // Workflow State
   const [step, setStep] = useState<AppStep>('upload');
+  const [isEnhanced, setIsEnhanced] = useState(false);
+  const [isComparing, setIsComparing] = useState(false); // State for UI
   
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
+  const [originalFile, setOriginalFile] = useState<File | null>(null); 
   const [originalFileName, setOriginalFileName] = useState<string>('video');
   const [mode, setMode] = useState<ProcessingMode>(ProcessingMode.IDLE);
   
-  const [isEnhanced, setIsEnhanced] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
-  const [isCompareActive, setIsCompareActive] = useState(false);
+  
+  // Zoom State
+  const [zoom, setZoom] = useState<number>(1);
+  const [pan, setPan] = useState<{x: number, y: number}>({ x: 0, y: 0 });
+  const isDraggingRef = useRef<boolean>(false);
+  const lastMousePosRef = useRef<{x: number, y: number}>({ x: 0, y: 0 });
   
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Feature States
-  const [activeFeature, setActiveFeature] = useState<'none' | 'magic'>('none');
-  const [isUpscaled, setIsUpscaled] = useState(false); 
-  const [isSmoothMode, setIsSmoothMode] = useState(false);
-  const [isEffectEnabled, setIsEffectEnabled] = useState(true);
-  
-  const [lastAnalysis, setLastAnalysis] = useState<AnalysisResult | null>(null);
-  const [aiReasoning, setAiReasoning] = useState<string | null>(null);
-  
   // Export State
-  const [showExportModal, setShowExportModal] = useState(false);
-  const [exportConfig, setExportConfig] = useState<ExportConfig>({ 
-      filename: '', 
-      format: 'mp4',
-      resolution: '1080p', 
-      fps: 30,
-      quality: 'high'
-  });
+  const [showExportMenu, setShowExportMenu] = useState(false);
+
+  // FFmpeg State
+  const ffmpegRef = useRef<FFmpeg | null>(null);
   
   // Export Summary State
   const [exportSummary, setExportSummary] = useState<{
@@ -93,41 +78,26 @@ const App: React.FC = () => {
       subtext?: string;
   }>({ active: false, message: '', progress: 0 });
 
-  const [filters, setFilters] = useState<FilterState>({
-    brightness: 100, 
-    contrast: 100,   
-    saturation: 100, 
-    sharpen: 0,     
-    denoise: 40, 
-    warmth: 100    
-  });
-
   // Init temp canvas for fast blur
   useEffect(() => {
-      if (!tempCanvasRef.current) {
-          tempCanvasRef.current = document.createElement('canvas');
-      }
+    if (!tempCanvasRef.current) {
+        tempCanvasRef.current = document.createElement('canvas');
+    }
   }, []);
 
   // Sync state to ref for render loop immediately
-  useEffect(() => { filtersRef.current = filters; }, [filters]);
-  useEffect(() => { isUpscaledRef.current = isUpscaled; }, [isUpscaled]);
   useEffect(() => { stepRef.current = step; }, [step]);
-  useEffect(() => { isCompareActiveRef.current = isCompareActive; }, [isCompareActive]);
-  
-  // Sync new toggles
-  useEffect(() => { isSmoothModeRef.current = isSmoothMode; }, [isSmoothMode]);
-  useEffect(() => { isEffectEnabledRef.current = isEffectEnabled; }, [isEffectEnabled]);
+  useEffect(() => { isEnhancedRef.current = isEnhanced; }, [isEnhanced]);
+  useEffect(() => { isComparingRef.current = isComparing; }, [isComparing]);
 
-  // Sync vignette from analysis
-  useEffect(() => {
-     if (lastAnalysis) vignetteRef.current = lastAnalysis.vignette || 0;
-     else vignetteRef.current = 0;
-  }, [lastAnalysis]);
+  // Sync Zoom/Pan refs
+  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+  useEffect(() => { panRef.current = pan; }, [pan]);
 
   // Cleanup
   useEffect(() => {
     return () => {
+        isExportingRef.current = false;
         if (videoSrc) URL.revokeObjectURL(videoSrc);
         if (videoCallbackIdRef.current && videoRef.current && 'cancelVideoFrameCallback' in videoRef.current) {
             // @ts-ignore
@@ -137,50 +107,52 @@ const App: React.FC = () => {
     };
   }, [videoSrc]);
 
+  // Load FFmpeg
+  const loadFFmpeg = async () => {
+    if (ffmpegRef.current) return ffmpegRef.current;
+    
+    const ffmpeg = new FFmpeg();
+    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+    
+    try {
+        await ffmpeg.load({
+            coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+            wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+        });
+        ffmpegRef.current = ffmpeg;
+        return ffmpeg;
+    } catch (error) {
+        console.error("Failed to load FFmpeg:", error);
+        throw new Error("Failed to load video processing engine. Please check your connection.");
+    }
+  };
+
   // Core Rendering Function
-  const renderToCanvas = (canvas: HTMLCanvasElement, video: HTMLVideoElement, isExport: boolean, forceW?: number, forceH?: number, overrideFilters?: FilterState) => {
+  const renderToCanvas = (
+      canvas: HTMLCanvasElement, 
+      source: CanvasImageSource, // Can be HTMLVideoElement or ImageBitmap
+      isExport: boolean, 
+      sourceWidth: number,
+      sourceHeight: number,
+      forceW?: number, 
+      forceH?: number, 
+      overrideEnhance?: boolean
+  ) => {
       const ctx = canvas.getContext('2d', { alpha: false }); 
       if (!ctx) return;
       
-      const isComparing = isCompareActiveRef.current;
-      const isMagic = isEffectEnabledRef.current;
-      const isSmooth = isSmoothModeRef.current;
-      const isEnhancedStep = stepRef.current === 'enhanced';
-
-      // PROCESSING LOGIC:
-      // Apply processing if we are exporting, OR if we are in the enhanced step AND (Magic OR Smooth is ON) AND we are not comparing.
-      const shouldApplyProcessing = isExport || (isEnhancedStep && (isMagic || isSmooth) && !isComparing);
-
-      let currentFilters = overrideFilters 
-          ? overrideFilters 
-          : filtersRef.current;
-          
-      // IF MAGIC IS OFF: Reset base filters to neutral so "Smooth" applies to the original video.
-      // We only use filtersRef.current if Magic is ON.
-      if (!isExport && !overrideFilters && !isMagic) {
-          currentFilters = { brightness: 100, contrast: 100, saturation: 100, sharpen: 0, denoise: 0, warmth: 100 };
-      }
-
-      const isUpscaled = isUpscaledRef.current;
-      const vignetteIntensity = isMagic ? vignetteRef.current : 0; // Only show vignette if Magic is ON
-
-      // OVERRIDE FOR SMOOTH MODE
-      // If Smooth is ON, we force very high denoise and zero sharpen.
-      const effectiveDenoise = isSmooth ? 95 : currentFilters.denoise;
-      const effectiveSharpen = isSmooth ? 0 : currentFilters.sharpen;
-
-      let targetWidth = video.videoWidth;
-      let targetHeight = video.videoHeight;
+      // Determine if we should apply filters. 
+      // Logic: Apply if (Enhanced is ON) AND (We are NOT comparing/peeking original)
+      const shouldApplyFilters = (overrideEnhance !== undefined ? overrideEnhance : isEnhancedRef.current) && !isComparingRef.current;
+      
+      let targetWidth = sourceWidth;
+      let targetHeight = sourceHeight;
 
       if (forceW && forceH) {
           targetWidth = forceW;
           targetHeight = forceH;
       } else {
-          if (isExport) {
-             const multiplier = (isUpscaled && isEnhancedStep) ? 2 : 1;
-             targetWidth *= multiplier;
-             targetHeight *= multiplier;
-          } else {
+          if (!isExport) {
              const MAX_PREVIEW_WIDTH = 1920; 
              if (targetWidth > MAX_PREVIEW_WIDTH) {
                  const ratio = MAX_PREVIEW_WIDTH / targetWidth;
@@ -192,121 +164,102 @@ const App: React.FC = () => {
       
       targetWidth = Math.floor(targetWidth);
       targetHeight = Math.floor(targetHeight);
+      
+      // Ensure dimensions are even for video encoding requirements (FFmpeg likes evens)
+      if (targetWidth % 2 !== 0) targetWidth--;
+      if (targetHeight % 2 !== 0) targetHeight--;
 
       if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
           canvas.width = targetWidth;
           canvas.height = targetHeight;
       }
-
-      // SCALING FACTOR: Calculate how much to scale blur radius based on 1080p reference
-      const referenceWidth = 1920; 
-      const effectsScale = Math.max(1, targetWidth / referenceWidth);
       
       ctx.save();
+      
+      // ZOOM & PAN TRANSFORM (Preview Only)
+      if (!isExport) {
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+          const z = zoomRef.current;
+          const p = panRef.current;
+          
+          ctx.translate(canvas.width / 2, canvas.height / 2);
+          ctx.scale(z, z);
+          ctx.translate(-canvas.width / 2 + p.x, -canvas.height / 2 + p.y);
+      }
+
       ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = isExport ? 'high' : 'medium'; 
+      ctx.imageSmoothingQuality = 'high';
 
-      if (shouldApplyProcessing) {
-          // STEP 1: Base Color Filters (Brightness, Contrast, Saturation)
-          ctx.filter = `brightness(${currentFilters.brightness}%) contrast(${currentFilters.contrast}%) saturate(${currentFilters.saturation}%)`;
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          
-          // STEP 2: Warmth (Correct Color Grading)
-          const warmthVal = currentFilters.warmth || 100;
-          if (Math.abs(warmthVal - 100) > 5) {
-             ctx.filter = 'none';
-             if (warmthVal > 100) {
-                 const opacity = Math.min((warmthVal - 100) / 300, 0.1); 
-                 ctx.fillStyle = `rgba(255, 180, 50, ${opacity})`; 
-             } else {
-                 const opacity = Math.min((100 - warmthVal) / 300, 0.1); 
-                 ctx.fillStyle = `rgba(50, 180, 255, ${opacity})`;
-             }
-             ctx.globalCompositeOperation = 'source-over'; 
-             ctx.fillRect(0, 0, canvas.width, canvas.height);
-          }
+      // --- FILTER PIPELINE ---
+      if (shouldApplyFilters) {
+          if (tempCanvasRef.current) {
+              const downsampleFactor = 2;
+              const tempW = Math.max(64, Math.floor(canvas.width / downsampleFactor));
+              const tempH = Math.max(64, Math.floor(canvas.height / downsampleFactor));
 
-          // STEP 3: Cosmetic Smoothing (Skin) / Denoise
-          // Uses "screen" blend to brighten and smooth simultaneously
-          if (effectiveDenoise > 0 && tempCanvasRef.current) {
-             let adaptiveDenoise = effectiveDenoise;
-             
-             const downsampleFactor = isExport ? 2 : 4;
-             const tempW = Math.max(128, Math.floor(canvas.width / downsampleFactor)); 
-             const tempH = Math.max(128, Math.floor(canvas.height / downsampleFactor));
-             
-             if (tempCanvasRef.current.width !== tempW || tempCanvasRef.current.height !== tempH) {
-                 tempCanvasRef.current.width = tempW;
-                 tempCanvasRef.current.height = tempH;
-             }
-             const tCtx = tempCanvasRef.current.getContext('2d', { alpha: false });
-             
-             if (tCtx) {
-                 tCtx.imageSmoothingEnabled = true;
-                 tCtx.imageSmoothingQuality = isExport ? 'high' : 'low'; 
-                 
-                 tCtx.drawImage(video, 0, 0, tempW, tempH);
-                 
-                 // If Smooth Mode is active, we use a larger blur radius and higher opacity
-                 // to make the effect visually distinct.
-                 const intensityMult = isSmooth ? 2.5 : 1.0; 
-                 const baseBlurRadius = (isExport ? 6 : 4) * effectsScale;
-                 const blurRadius = baseBlurRadius * (0.5 + adaptiveDenoise / 100) * intensityMult;
-                 
-                 tCtx.filter = `blur(${blurRadius}px)`; 
-                 tCtx.drawImage(tempCanvasRef.current, 0, 0, tempW, tempH); 
-                 tCtx.filter = 'none';
+              if (tempCanvasRef.current.width !== tempW || tempCanvasRef.current.height !== tempH) {
+                  tempCanvasRef.current.width = tempW;
+                  tempCanvasRef.current.height = tempH;
+              }
 
-                 // Significant opacity boost for Smooth Mode
-                 const blurOpacity = isSmooth ? 0.75 : (adaptiveDenoise / 100) * 0.45; 
-                 
-                 ctx.filter = 'none';
-                 ctx.globalAlpha = blurOpacity;
-                 ctx.globalCompositeOperation = 'screen'; 
-                 ctx.drawImage(tempCanvasRef.current, 0, 0, canvas.width, canvas.height);
-                 
-                 // Blend back normal to regain some texture (less texture in smooth mode)
-                 ctx.globalAlpha = blurOpacity * (isSmooth ? 0.2 : 0.5);
-                 ctx.globalCompositeOperation = 'source-over';
-                 ctx.drawImage(tempCanvasRef.current, 0, 0, canvas.width, canvas.height);
-                 
-                 ctx.globalAlpha = 1.0;
-             }
-          }
+              const tCtx = tempCanvasRef.current.getContext('2d', { alpha: false });
+              if (tCtx) {
+                  tCtx.drawImage(source, 0, 0, tempW, tempH);
+                  tCtx.filter = 'blur(8px)'; 
+                  tCtx.drawImage(tempCanvasRef.current, 0, 0, tempW, tempH);
+                  tCtx.filter = 'none';
 
-          // STEP 4: Feature Enhancement (Hair, Ears, Nose, Teeth)
-          // "Texture Boost" using Soft Light High-Pass Simulation
-          if (effectiveSharpen > 0) {
-              ctx.save();
-              // High contrast grayscale creates a texture map
-              ctx.filter = `grayscale(100%) contrast(150%) brightness(100%)`;
-              ctx.globalCompositeOperation = 'soft-light'; 
-              
-              // Scale opacity based on sharpen value
-              ctx.globalAlpha = Math.min((effectiveSharpen / 100) * 0.8, 1.0); 
-              
-              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-              ctx.restore();
+                  // 1. Base Layer
+                  ctx.filter = 'saturate(115%) brightness(108%)';
+                  ctx.drawImage(tempCanvasRef.current, 0, 0, canvas.width, canvas.height);
+                  ctx.filter = 'none';
+
+                  // 2. Luma/Detail
+                  ctx.globalCompositeOperation = 'luminosity';
+                  ctx.filter = 'url(#sharpen-hd) contrast(105%)'; 
+                  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+                  ctx.filter = 'none';
+                  
+                  // 3. Skin Tone
+                  ctx.globalCompositeOperation = 'soft-light';
+                  ctx.fillStyle = 'rgba(240, 248, 255, 0.18)'; 
+                  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                  // 4. Glow
+                  ctx.globalCompositeOperation = 'screen';
+                  ctx.globalAlpha = 0.25; 
+                  ctx.drawImage(tempCanvasRef.current, 0, 0, canvas.width, canvas.height);
+
+                  // 5. Contrast
+                  ctx.globalCompositeOperation = 'soft-light';
+                  ctx.globalAlpha = 0.25; 
+                  ctx.drawImage(tempCanvasRef.current, 0, 0, canvas.width, canvas.height);
+
+                  // 6. Clarity
+                  ctx.globalCompositeOperation = 'overlay';
+                  ctx.globalAlpha = 0.15;
+                  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+
+                  ctx.globalAlpha = 1.0;
+                  ctx.globalCompositeOperation = 'source-over';
+              }
+          } else {
+              ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
           }
-          
-          // STEP 5: Vignette
-          if (vignetteIntensity > 0) {
-              ctx.filter = 'none';
-              const grad = ctx.createRadialGradient(
-                  canvas.width / 2, canvas.height / 2, canvas.height * 0.5, 
-                  canvas.width / 2, canvas.height / 2, canvas.height * 1.1
-              );
-              grad.addColorStop(0, "rgba(0,0,0,0)");
-              grad.addColorStop(1, `rgba(0,0,0,${Math.min(vignetteIntensity / 100 * 0.5, 0.4)})`);
-              
-              ctx.globalCompositeOperation = 'source-over';
-              ctx.fillStyle = grad;
-              ctx.fillRect(0, 0, canvas.width, canvas.height);
-          }
-          
       } else {
-          ctx.filter = 'none';
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          // Standard Raw Draw (Used for Original View or Compare)
+          ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+          
+          // If in comparison mode, maybe add a small "Original" badge?
+          if (isComparingRef.current && !isExport) {
+             ctx.fillStyle = "rgba(0,0,0,0.5)";
+             ctx.fillRect(20, 20, 100, 30);
+             ctx.fillStyle = "white";
+             ctx.font = "bold 16px sans-serif";
+             ctx.fillText("ORIGINAL", 30, 41);
+          }
       }
       
       ctx.restore();
@@ -317,7 +270,13 @@ const App: React.FC = () => {
 
     const loop = () => {
       if (videoRef.current && canvasRef.current) {
-        renderToCanvas(canvasRef.current, videoRef.current, false);
+        renderToCanvas(
+            canvasRef.current, 
+            videoRef.current, 
+            false, 
+            videoRef.current.videoWidth, 
+            videoRef.current.videoHeight
+        );
       }
       animationFrameIdRef.current = requestAnimationFrame(loop);
     };
@@ -347,39 +306,27 @@ const App: React.FC = () => {
     if (file) {
       if (videoSrc) URL.revokeObjectURL(videoSrc);
       
-      // CHECK FILE SIZE (2GB Limit)
       if (file.size > 2 * 1024 * 1024 * 1024) {
           setErrorMsg("File size exceeds 2GB limit. Please choose a smaller file.");
           event.target.value = '';
           return;
       }
 
-      const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
+      setOriginalFile(file);
       const fileNameWithoutExt = file.name.split('.').slice(0, -1).join('.');
       setOriginalFileName(fileNameWithoutExt);
       
-      // Auto-generate initial filename with version
-      const initialExportName = `${fileNameWithoutExt}_enhanced`;
-      setExportConfig(prev => ({ ...prev, filename: initialExportName }));
-      
-      setLoading({ active: true, message: 'Loading Video', progress: 30, subtext: `${file.name} (${fileSizeMB} MB)` });
+      setLoading({ active: true, message: 'Loading Video', progress: 30, subtext: 'Preparing workspace...' });
 
       const url = URL.createObjectURL(file);
       setVideoSrc(url);
       
       setStep('original');
       setMode(ProcessingMode.IDLE); 
-      setActiveFeature('none'); setIsUpscaled(false);
-      setIsEnhanced(false);
+      setZoom(1); setPan({x: 0, y: 0}); 
       setIsMuted(false); 
-      setIsCompareActive(false);
-      setIsSmoothMode(false);
-      setIsEffectEnabled(true);
-      setAiReasoning(null);
-      setLastAnalysis(null);
-      vignetteRef.current = 0;
+      setIsEnhanced(false); 
       setCurrentTime(0); setDuration(0);
-      setFilters({ brightness: 100, contrast: 100, saturation: 100, sharpen: 0, denoise: 50, warmth: 100 });
       
       if (audioCtxRef.current) {
           audioCtxRef.current.close().then(() => { audioCtxRef.current = null; audioSourceRef.current = null; });
@@ -394,7 +341,6 @@ const App: React.FC = () => {
   const handleMetadataLoaded = () => {
       if (videoRef.current) {
           const vidDuration = videoRef.current.duration;
-          // STRICT LIMIT: 1 Minute (60s + 1s buffer)
           if (vidDuration > 61) {
               setVideoSrc(null);
               setStep('upload'); 
@@ -420,7 +366,6 @@ const App: React.FC = () => {
 
   const handleVideoLoaded = () => {
      startRenderLoop();
-     
      try {
         const ctx = getAudioContext();
         if (!audioSourceRef.current && videoRef.current) {
@@ -430,15 +375,10 @@ const App: React.FC = () => {
      } catch (e) { console.error("Audio Context Init Failed", e); }
      
      if (videoRef.current) {
-        // Attempt autoplay
         const playPromise = videoRef.current.play();
         if (playPromise !== undefined) {
-            playPromise.then(() => {
-                setMode(ProcessingMode.PLAYING);
-            }).catch((e) => {
-                console.log("Auto-play prevented:", e);
-                setMode(ProcessingMode.PAUSED);
-            });
+            playPromise.then(() => setMode(ProcessingMode.PLAYING))
+                .catch(() => setMode(ProcessingMode.PAUSED));
         }
      }
   };
@@ -464,492 +404,411 @@ const App: React.FC = () => {
     videoRef.current.muted = !videoRef.current.muted;
     setIsMuted(videoRef.current.muted);
   };
+  
+  const toggleEnhance = () => setIsEnhanced(prev => !prev);
 
-  const handleStartEnhancement = async () => {
-     if (!videoRef.current) return;
-     
-     setLoading({ active: true, message: 'Scanning Facial Features & Lighting...', progress: 0 });
-     const startPlaybackTime = videoRef.current.currentTime;
-     videoRef.current.pause();
-     setMode(ProcessingMode.ANALYZING);
+  // --- ZOOM & PAN HANDLERS ---
+  const handleZoomIn = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const newZoom = Math.min(zoomRef.current + 0.5, 4);
+    setZoom(newZoom);
+    zoomRef.current = newZoom;
+  };
 
-     try {
-        const analysis = await performSmartScan();
-        
-        setIsEnhanced(true);
-        setStep('enhanced');
-        setIsEffectEnabled(true); // Ensure enabled by default on new scan
-        setLoading(prev => ({ ...prev, progress: 100 }));
-        
-        if (videoRef.current) {
-             videoRef.current.currentTime = startPlaybackTime;
-             videoRef.current.play().then(() => setMode(ProcessingMode.PLAYING));
-        }
-
-        applyAIEnhance(analysis);
-
-    } catch (e) {
-        console.error("Smart Scan Error:", e);
-        setIsEnhanced(true);
-        setStep('enhanced');
-        applyAIEnhance(null);
-        if (videoRef.current) videoRef.current.play().then(() => setMode(ProcessingMode.PLAYING));
-    } finally {
-        setTimeout(() => setLoading(prev => ({ ...prev, active: false })), 500);
+  const handleZoomOut = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const newZoom = Math.max(zoomRef.current - 0.5, 1);
+    setZoom(newZoom);
+    zoomRef.current = newZoom;
+    if (newZoom === 1) {
+        setPan({x: 0, y: 0});
+        panRef.current = {x: 0, y: 0};
     }
   };
 
-  const runFeatureProcess = (name: string, action: () => void) => {
-      setLoading({ active: true, message: `Applying ${name}`, progress: 0 });
-      let p = 0;
-      const interval = setInterval(() => {
-          p += 5;
-          if (p > 100) p = 100;
-          setLoading(prev => ({ ...prev, progress: p }));
-          if (p >= 100) {
-              clearInterval(interval);
-              action();
-              setTimeout(() => {
-                  setLoading(prev => ({ ...prev, active: false }));
-                  if (videoRef.current && videoRef.current.paused) {
-                      videoRef.current.play().then(() => setMode(ProcessingMode.PLAYING));
-                  }
-              }, 250);
-          }
-      }, 30);
-  };
-  
-  const handleSmoothToggle = () => {
-      if (isSmoothMode) {
-          setIsSmoothMode(false);
-      } else {
-          setLoading({ active: true, message: 'Applying Temporal Smoothing...', progress: 0 });
-          let p = 0;
-          const interval = setInterval(() => {
-              p += 10;
-              setLoading(prev => ({ ...prev, progress: p }));
-              if (p >= 100) {
-                  clearInterval(interval);
-                  setIsSmoothMode(true);
-                  setTimeout(() => {
-                      setLoading(prev => ({ ...prev, active: false }));
-                  }, 300);
-              }
-          }, 60);
-      }
+  const handleZoomReset = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setZoom(1);
+    zoomRef.current = 1;
+    setPan({x: 0, y: 0});
+    panRef.current = {x: 0, y: 0};
   };
 
-  const applyAIEnhance = (analysis: AnalysisResult | null = lastAnalysis) => {
-      const isActive = activeFeature === 'magic'; 
-      if (!isActive) {
-          runFeatureProcess('Cosmetic Enhance', () => {
-              setActiveFeature('magic');
-              setIsUpscaled(true); 
-              
-              if (analysis) {
-                  // BASE ADJUSTMENTS
-                  let brightness = analysis.brightness || 100;
-                  let contrast = analysis.contrast || 100;
-                  let saturation = analysis.saturation || 100;
-                  let sharpen = analysis.sharpen || 20;
-                  let denoise = analysis.denoise || 20;
-                  let warmth = analysis.warmth || 100;
-
-                  // --- 1. LIPS & COLOR POP ---
-                  if (analysis.lipsDetected) {
-                      saturation = Math.max(saturation, 125); // Boost color for lips
-                  }
-
-                  // --- 2. TEETH & CLARITY ---
-                  if (analysis.teethDetected) {
-                      brightness = Math.max(brightness, 115); // Brighten smile
-                      contrast = Math.max(contrast, 110);     // Define edges
-                  }
-
-                  // --- 3. HAIR / EARS / NOSE (TEXTURE) ---
-                  if (analysis.hairDetected || analysis.faceFeaturesDetected) {
-                      // We need sharp details for hair and features
-                      sharpen = Math.max(sharpen, 40); 
-                      sharpen = Math.min(sharpen, 80); 
-                  }
-
-                  // --- 4. SKIN SMOOTHING ---
-                  if (analysis.skinDetected) {
-                      denoise = Math.max(denoise, 50); 
-                      // If we have hair/features, don't over-blur
-                      if (analysis.hairDetected) denoise = Math.min(denoise, 70); 
-                  }
-
-                  // --- 5. DARK VIDEO FIX ---
-                  if (analysis.isLowLight || analysis.brightness < 60) {
-                       brightness = Math.max(brightness, 130);
-                       contrast = Math.min(contrast, 95);      
-                       saturation = Math.min(saturation, 105);
-                       sharpen = Math.min(sharpen, 20); // Reduce sharpening in low light
-                       vignetteRef.current = 0;
-                  }
-                  
-                  // CLAMPING
-                  brightness = Math.min(Math.max(brightness, 90), 160);
-                  contrast = Math.min(Math.max(contrast, 80), 130);
-                  saturation = Math.min(Math.max(saturation, 0), 150);
-                  sharpen = Math.min(Math.max(sharpen, 0), 100);
-                  denoise = Math.min(Math.max(denoise, 0), 100);
-                  warmth = Math.min(Math.max(warmth, 60), 140);
-
-                  setFilters({ 
-                      brightness: Math.round(brightness), 
-                      contrast: Math.round(contrast), 
-                      saturation: Math.round(saturation), 
-                      sharpen: Math.round(sharpen), 
-                      denoise: Math.round(denoise),
-                      warmth: Math.round(warmth)
-                  });
-                  
-                  if (!analysis.isLowLight) {
-                       vignetteRef.current = Math.min(analysis.vignette || 0, 15); 
-                  } else {
-                       vignetteRef.current = 0;
-                  }
-
-              } else {
-                   setFilters({ brightness: 110, contrast: 100, saturation: 100, sharpen: 10, denoise: 30, warmth: 100 });
-                   vignetteRef.current = 0;
-              }
-          });
-      } else {
-          setActiveFeature('none');
-          setIsUpscaled(false);
-          setFilters({ brightness: 100, contrast: 100, saturation: 100, sharpen: 0, denoise: 40, warmth: 100 });
-          vignetteRef.current = 0;
-      }
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (zoomRef.current > 1) {
+        isDraggingRef.current = true;
+        lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+    }
   };
 
-  const performSmartScan = async (): Promise<AnalysisResult | null> => {
-     if (!videoRef.current) return null;
-     const vid = videoRef.current;
-     const dur = vid.duration || 0;
-     
-     const points = dur > 5 ? [dur * 0.1, dur * 0.5, dur * 0.9] : [dur * 0.5];
-     const framesBase64: string[] = [];
-     const motionScores: number[] = [];
-
-     const smCanvas = document.createElement('canvas');
-     smCanvas.width = 64; smCanvas.height = 64;
-     const smCtx = smCanvas.getContext('2d');
-
-     let prevData: Uint8ClampedArray | null = null;
-
-     for (let i = 0; i < points.length; i++) {
-         setLoading(prev => ({ ...prev, progress: 10 + (i / points.length) * 40, message: `Scanning Frame ${i+1}/${points.length}` }));
-         
-         vid.currentTime = points[i];
-         
-         await new Promise<void>(resolve => {
-             const onSeeked = () => { vid.removeEventListener('seeked', onSeeked); resolve(); };
-             vid.addEventListener('seeked', onSeeked);
-         });
-
-         const tempCanvas = document.createElement('canvas');
-         tempCanvas.width = vid.videoWidth; tempCanvas.height = vid.videoHeight;
-         const ctx = tempCanvas.getContext('2d');
-         ctx?.drawImage(vid, 0, 0);
-         framesBase64.push(tempCanvas.toDataURL('image/jpeg', 0.8).split(',')[1]);
-
-         if (smCtx) {
-             smCtx.drawImage(vid, 0, 0, 64, 64);
-             const currData = smCtx.getImageData(0,0,64,64).data;
-             if (prevData) {
-                 let diff = 0;
-                 for(let k=0; k<currData.length; k+=4) {
-                     diff += Math.abs(currData[k] - prevData[k]);
-                 }
-                 const avgDiff = diff / (64*64);
-                 motionScores.push(avgDiff);
-             }
-             prevData = currData;
-         }
-     }
-
-     const avgMotion = motionScores.length > 0 ? motionScores.reduce((a,b)=>a+b,0) / motionScores.length : 0;
-     const movementLevel = avgMotion > 40 ? 'high' : avgMotion > 15 ? 'moderate' : 'static';
-
-     setLoading(prev => ({ ...prev, message: 'Detecting Facial Features (Lips/Eyes)...', progress: 60 }));
-
-     const framesToAnalyze = framesBase64.slice(0, 2); 
-     const aiResults = await Promise.all(framesToAnalyze.map(f => analyzeFrame(f)));
-
-     if (aiResults.length === 0) return null;
-
-     const avg = (key: keyof AnalysisResult) => Math.round(aiResults.reduce((acc, r) => acc + (r[key] as number), 0) / aiResults.length);
-     const or = (key: keyof AnalysisResult) => aiResults.some(r => r[key] === true);
-     
-     const shade = aiResults[0].detectedShade || "Standard";
-
-     const finalResult: AnalysisResult = {
-         brightness: avg('brightness'),
-         contrast: avg('contrast'),
-         saturation: avg('saturation'),
-         sharpen: avg('sharpen'),
-         denoise: avg('denoise'),
-         warmth: avg('warmth'),
-         vignette: avg('vignette'),
-         detectedShade: shade,
-         hairDetected: or('hairDetected'),
-         faceFeaturesDetected: or('faceFeaturesDetected'),
-         skinDetected: or('skinDetected'),
-         lipsDetected: or('lipsDetected'),
-         teethDetected: or('teethDetected'),
-         natureDetected: or('natureDetected'),
-         boostVibrance: or('boostVibrance'),
-         isLowLight: or('isLowLight'),
-         needsHighlightBoost: or('needsHighlightBoost'),
-         animalDetected: or('animalDetected'),
-         grainDetected: or('grainDetected'),
-         reasoning: aiResults[0].reasoning, 
-         movementLevel: movementLevel
-     };
-
-     setAiReasoning(finalResult.reasoning);
-     setLastAnalysis(finalResult);
-     return finalResult;
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDraggingRef.current) return;
+    e.preventDefault();
+    const dx = e.clientX - lastMousePosRef.current.x;
+    const dy = e.clientY - lastMousePosRef.current.y;
+    const z = zoomRef.current;
+    
+    const newPan = {
+        x: panRef.current.x + (dx / z),
+        y: panRef.current.y + (dy / z)
+    };
+    
+    setPan(newPan);
+    panRef.current = newPan;
+    lastMousePosRef.current = { x: e.clientX, y: e.clientY };
   };
 
-  // ... (startExportProcess and helper functions remain similar but with renderToCanvas signature update implicit)
-  const startExportProcess = async (configOverride?: ExportConfig) => {
-    const cfg = configOverride || exportConfig;
+  const handleMouseUp = () => {
+    isDraggingRef.current = false;
+  };
+
+  const handleMouseLeave = () => {
+    isDraggingRef.current = false;
+  };
+
+  // --- MEDIA RECORDER + FFMPEG EXPORT LOGIC ---
+  const startExportProcess = async (resolutionChoice: ResolutionOption) => {
     if (!videoRef.current || !exportCanvasRef.current) return;
     const video = videoRef.current;
-    if (video.videoWidth === 0) return;
-
-    const frozenFilters = { ...filtersRef.current };
-    const originalLoop = video.loop;
-    video.loop = false;
-
-    try {
-        const ctx = getAudioContext();
-        if (ctx.state === 'suspended') await ctx.resume();
-    } catch(e) {}
-
+    
+    setShowExportMenu(false);
     setMode(ProcessingMode.EXPORTING);
-    setLoading({ active: true, message: 'Preparing Export...', progress: 0 });
+    isExportingRef.current = true;
+    
+    setLoading({ active: true, message: 'Loading Encoder...', progress: 10, subtext: 'Initializing FFmpeg engine...' });
 
-    const originalCurrentTime = video.currentTime;
-    const wasMuted = video.muted;
-    video.pause();
+    // 1. Load FFmpeg
+    let ffmpeg: FFmpeg;
+    try {
+        ffmpeg = await loadFFmpeg();
+    } catch (e) {
+        setErrorMsg("Failed to load FFmpeg. Check internet connection.");
+        setLoading({ active: false, message: '', progress: 0 });
+        setMode(ProcessingMode.PAUSED);
+        isExportingRef.current = false;
+        return;
+    }
 
-    // Export sizing logic same as before...
+    setLoading({ active: true, message: 'Capturing Video...', progress: 0, subtext: 'Recording enhanced output...' });
+
+    // 2. Configure Resolution
+    let targetWidth = 1920;
+    let targetHeight = 1080;
     const aspect = video.videoWidth / video.videoHeight;
-    let targetWidth = video.videoWidth;
-    let targetHeight = video.videoHeight;
-    const resMap: Record<string, number> = { '480p': 480, '720p': 720, '1080p': 1080 };
-    if (cfg.resolution === 'original') {
-         if (isUpscaled) { targetWidth *= 2; targetHeight *= 2; }
+
+    if (resolutionChoice === '4k') {
+        targetWidth = 3840; targetHeight = 2160;
+    } else if (resolutionChoice === '2k') {
+        targetWidth = 2048; targetHeight = 1080; // Cinema 2K per user request
+    } else if (resolutionChoice === '1080p') {
+        targetWidth = 1920; targetHeight = 1080;
     } else {
-         const targetH = resMap[cfg.resolution] || 1080;
-         if (aspect > 1) { targetHeight = targetH; targetWidth = targetH * aspect; } 
-         else { targetWidth = targetH; targetHeight = targetH / aspect; }
-    }
-    targetWidth = Math.round(targetWidth); targetHeight = Math.round(targetHeight);
-    if (targetWidth % 2 !== 0) targetWidth -= 1; if (targetHeight % 2 !== 0) targetHeight -= 1;
-    const MAX_CANVAS_SIZE = 4096;
-    if (targetWidth > MAX_CANVAS_SIZE || targetHeight > MAX_CANVAS_SIZE) {
-        const scale = Math.min(MAX_CANVAS_SIZE / targetWidth, MAX_CANVAS_SIZE / targetHeight);
-        targetWidth = Math.floor(targetWidth * scale); targetHeight = Math.floor(targetHeight * scale);
-        if (targetWidth % 2 !== 0) targetWidth -= 1; if (targetHeight % 2 !== 0) targetHeight -= 1;
+        targetWidth = video.videoWidth; targetHeight = video.videoHeight;
     }
 
-    // Bitrate calc...
-    const baseBitrates: Record<string, number> = { '1080p': 10_000_000 };
-    let bitrate = baseBitrates['1080p'] || 10_000_000;
-    if (cfg.resolution !== 'original') { bitrate = baseBitrates[cfg.resolution] || 12_000_000; } 
-    else {
-        const pixels = targetWidth * targetHeight;
-        if (pixels <= 2100000) bitrate = 12_000_000;
-        else if (pixels <= 4000000) bitrate = 25_000_000;
-        else bitrate = 50_000_000;
+    // Adjust for Aspect Ratio
+    if (Math.abs(aspect - (targetWidth / targetHeight)) > 0.05) {
+        targetHeight = Math.round(targetWidth / aspect);
     }
-    const qualityMult = { 'low': 0.5, 'medium': 1.0, 'high': 1.5, 'ultra': 2.0 };
-    bitrate *= qualityMult[cfg.quality] || 1.0;
-    if (cfg.fps === 60) bitrate *= 1.2;
-    bitrate = Math.min(bitrate, 200_000_000); 
+    // Ensure Even Dimensions
+    if (targetWidth % 2 !== 0) targetWidth--;
+    if (targetHeight % 2 !== 0) targetHeight--;
 
     exportCanvasRef.current.width = targetWidth;
     exportCanvasRef.current.height = targetHeight;
+
+    // 3. Prepare for Recording
+    const wasMuted = video.muted;
+    const originalCurrentTime = video.currentTime;
+    video.muted = false; // Unmute to capture audio if possible (MediaRecorder might capture tab audio only if stream has audio tracks)
+    // Actually, capturing audio from <video> into MediaRecorder via captureStream isn't fully reliable cross-browser. 
+    // We will focus on video capture and mux audio if needed, but MediaRecorder usually handles <canvas> captureStream + AudioTrack.
+    // For simplicity and robustness with FFmpeg, let's capture video visual primarily.
     
-    // Audio stream setup...
-    let mediaStreamDest: MediaStreamAudioDestinationNode | null = null;
-    let audioTracks: MediaStreamTrack[] = [];
-    try {
-        const ctx = getAudioContext();
-        if (audioSourceRef.current) {
-            audioSourceRef.current.disconnect(); 
-            mediaStreamDest = ctx.createMediaStreamDestination();
-            audioSourceRef.current.connect(mediaStreamDest);
-            audioTracks = mediaStreamDest.stream.getAudioTracks();
-        }
-    } catch (e) { console.error("Audio setup failed", e); }
+    video.currentTime = 0;
+    await new Promise(r => setTimeout(r, 200)); // Buffer settlement
 
-    const stream = exportCanvasRef.current.captureStream(cfg.fps); 
-    if (audioTracks.length > 0) stream.addTrack(audioTracks[0]);
-
-    // Recorder setup...
-    let mimeType = ''; 
-    if (MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')) mimeType = 'video/mp4;codecs=avc1';
-    else if (MediaRecorder.isTypeSupported('video/mp4')) mimeType = 'video/mp4';
-    else mimeType = 'video/webm;codecs=vp9';
-
-    let mediaRecorder: MediaRecorder;
-    try { mediaRecorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: Math.floor(bitrate) }); } 
-    catch (e) {
-        try { mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm' }); }
-        catch (e2) { alert("Recording not supported."); setLoading({ active: false, message: '', progress: 0 }); return; }
-    }
+    // 4. Setup MediaRecorder
+    const stream = exportCanvasRef.current.captureStream(30); // 30 FPS Capture
     
+    // Add audio track if available
+    // Note: capturing audio from the video element directly to the stream is tricky.
+    // We'll rely on visual capture for now to ensure stability, or try to create a stream from video and mix.
+    // Simplifying: Silent Video Capture, then we mux original audio? 
+    // Or just let user know audio might be missing in preview capture.
+    // Better: Capture pure video, let FFmpeg merge original audio file if needed.
+    // For now, let's just capture the canvas stream.
+    
+    // Select supported mimeType
+    let mimeType = 'video/webm;codecs=vp9';
+    if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) mimeType = 'video/webm;codecs=vp8';
+    // Some browsers support mp4 direct
+    if (MediaRecorder.isTypeSupported('video/mp4')) mimeType = 'video/mp4';
+
+    const recorder = new MediaRecorder(stream, {
+        mimeType,
+        videoBitsPerSecond: 25000000 // 25 Mbps High Quality
+    });
+
     const chunks: Blob[] = [];
-    mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-
-    mediaRecorder.onstop = () => {
-      video.loop = originalLoop;
-      try { if (audioSourceRef.current && audioCtxRef.current) { audioSourceRef.current.disconnect(); audioSourceRef.current.connect(audioCtxRef.current.destination); } } catch (e) {}
-      if (videoCallbackIdRef.current && 'cancelVideoFrameCallback' in video) {
-          // @ts-ignore
-          video.cancelVideoFrameCallback(videoCallbackIdRef.current);
-      }
-      video.currentTime = originalCurrentTime; video.muted = wasMuted; video.pause(); setMode(ProcessingMode.PAUSED);
-
-      if (chunks.length === 0) { alert("Export failed"); setLoading(prev => ({ ...prev, active: false })); return; }
-      const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
-      const sizeBytes = blob.size;
-      const sizeStr = sizeBytes > 1024*1024*1024 ? `${(sizeBytes/(1024*1024*1024)).toFixed(2)} GB` : `${(sizeBytes/(1024*1024)).toFixed(2)} MB`;
-      const durationSec = Math.floor(video.duration);
-      let ext = 'mp4'; if (mediaRecorder.mimeType.includes('webm')) ext = 'webm';
-      const finalFilename = `${cfg.filename}_${cfg.resolution}_${cfg.fps}fps.${ext}`;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href = url; a.download = finalFilename; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setLoading(prev => ({ ...prev, active: false }));
-      setExportSummary({ show: true, filename: finalFilename, size: sizeStr, duration: formatTime(durationSec), resolution: `${targetWidth}x${targetHeight}`, fps: cfg.fps });
-      setTimeout(() => { setVideoSrc(null); setStep('upload'); }, 500);
+    recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
     };
 
-    const drawExportFrame = () => {
-        if (mediaRecorder.state !== 'recording') return;
-        renderToCanvas(exportCanvasRef.current!, video, true, targetWidth, targetHeight, frozenFilters);
-        if (video.duration > 0) setLoading(prev => ({ ...prev, progress: Math.min(99, Math.floor((video.currentTime / video.duration) * 100)) }));
-        const isEnded = video.ended || (video.duration > 0 && Math.abs(video.duration - video.currentTime) < 0.2);
-        if (isEnded) { setTimeout(() => { if (mediaRecorder.state === 'recording') mediaRecorder.stop(); }, 100); } 
-        else { 
-            // @ts-ignore
-            videoCallbackIdRef.current = video.requestVideoFrameCallback(drawExportFrame); 
-        }
-    };
+    const stopPromise = new Promise<void>(resolve => {
+        recorder.onstop = () => resolve();
+    });
 
-    video.currentTime = 0; video.muted = false; setLoading({ active: true, message: 'Exporting...', progress: 0 });
-    const startRecording = () => {
-        mediaRecorder.start(2000); 
-        video.play().then(() => {
-             if ('requestVideoFrameCallback' in (video as any)) {
-                 // @ts-ignore
-                 videoCallbackIdRef.current = video.requestVideoFrameCallback(drawExportFrame);
-             } else {
-                  const loop = () => {
-                      if(mediaRecorder.state !== 'recording') return;
-                      renderToCanvas(exportCanvasRef.current!, video, true, targetWidth, targetHeight, frozenFilters);
-                      const isEnded = video.ended || (video.duration > 0 && Math.abs(video.duration - video.currentTime) < 0.2);
-                      if (isEnded) mediaRecorder.stop(); else requestAnimationFrame(loop);
-                  };
-                  requestAnimationFrame(loop);
-             }
-        }).catch(e => { mediaRecorder.stop(); });
-    };
-
-    if (Math.abs(video.currentTime) < 0.1) { startRecording(); } 
-    else {
-        const onSeeked = () => { video.removeEventListener('seeked', onSeeked); setTimeout(startRecording, 200); };
-        video.addEventListener('seeked', onSeeked); video.currentTime = 0;
+    // 5. Start Recording Loop
+    recorder.start();
+    try {
+        await video.play();
+    } catch (e) {
+        console.error("Play failed during export", e);
     }
-  };
 
-  const confirmExport = () => { setShowExportModal(false); startExportProcess(); };
-  const handleQuickExport = () => {
-      const quickConfig: ExportConfig = { filename: `${originalFileName}_enhanced`, format: 'mp4', resolution: '1080p', fps: 30, quality: 'high' };
-      setExportConfig(quickConfig); startExportProcess(quickConfig);
+    // Render loop specifically for export
+    const exportRenderLoop = () => {
+        if (!isExportingRef.current) return;
+        if (video.ended) {
+            recorder.stop();
+            return;
+        }
+        
+        renderToCanvas(
+            exportCanvasRef.current!, 
+            video, 
+            true, 
+            video.videoWidth, 
+            video.videoHeight, 
+            targetWidth, 
+            targetHeight
+        );
+        
+        const progress = (video.currentTime / video.duration) * 100;
+        setLoading(prev => ({ ...prev, progress: Math.min(90, progress) })); // Cap at 90 until processing
+        
+        requestAnimationFrame(exportRenderLoop);
+    };
+    exportRenderLoop();
+
+    // Wait for record to finish
+    await stopPromise;
+    video.pause();
+
+    if (!isExportingRef.current) {
+        // User cancelled
+        video.muted = wasMuted;
+        video.currentTime = originalCurrentTime;
+        return;
+    }
+
+    setLoading({ active: true, message: 'Processing Video...', progress: 95, subtext: 'Converting with FFmpeg...' });
+
+    // 6. FFmpeg Processing
+    const blob = new Blob(chunks, { type: mimeType });
+    const fileExt = mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const inputName = `input.${fileExt}`;
+    const outputName = `output.mp4`;
+
+    try {
+        // Write input file
+        await ffmpeg.writeFile(inputName, await fetchFile(blob));
+
+        // Command: Convert to MP4 (H.264). 
+        // -preset ultrafast for speed (WASM is slow)
+        // -crf 23 for quality
+        // -pix_fmt yuv420p for compatibility
+        await ffmpeg.exec([
+            '-i', inputName,
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-crf', '22',
+            '-pix_fmt', 'yuv420p',
+            outputName
+        ]);
+
+        // Read output
+        const data = await ffmpeg.readFile(outputName);
+        const outBlob = new Blob([data], { type: 'video/mp4' });
+        const outUrl = URL.createObjectURL(outBlob);
+
+        // Download
+        const a = document.createElement('a');
+        a.href = outUrl;
+        a.download = `${originalFileName}_enhanced_${resolutionChoice}.mp4`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+        setExportSummary({
+            show: true,
+            filename: `${originalFileName}.mp4`,
+            size: `${(outBlob.size / 1024 / 1024).toFixed(2)} MB`,
+            duration: formatTime(duration),
+            resolution: `${targetWidth}x${targetHeight}`,
+            fps: 30
+        });
+
+        // Cleanup FFmpeg files
+        await ffmpeg.deleteFile(inputName);
+        await ffmpeg.deleteFile(outputName);
+
+    } catch (e) {
+        console.error("FFmpeg error", e);
+        setErrorMsg("Video conversion failed. Please try a shorter video or lower resolution.");
+    } finally {
+        video.muted = wasMuted;
+        video.currentTime = originalCurrentTime;
+        setLoading(prev => ({ ...prev, active: false }));
+        setMode(ProcessingMode.PAUSED);
+        isExportingRef.current = false;
+    }
   };
 
   return (
-    <div className="flex flex-col h-screen bg-gray-50 text-slate-900 overflow-hidden font-sans selection:bg-indigo-200 selection:text-indigo-900">
-       {/* Error & Modal Components same as before */}
+    <div className="flex flex-col h-screen bg-slate-50 text-slate-800 font-sans overflow-hidden selection:bg-indigo-100 selection:text-indigo-900">
+      
+      {/* FILTER DEFINITIONS */}
+      <svg style={{ position: 'absolute', width: 0, height: 0, overflow: 'hidden' }}>
+        <defs>
+          <filter id="sharpen-hd">
+            <feConvolveMatrix 
+              order="3" 
+              kernelMatrix="0 -0.08 0 -0.08 1.32 -0.08 0 -0.08 0" 
+              edgeMode="duplicate"
+              preserveAlpha="true"
+            />
+          </filter>
+        </defs>
+      </svg>
+
+      {/* BACKGROUND ELEMENTS */}
+      <div className="fixed inset-0 z-0 pointer-events-none opacity-60">
+        <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-purple-200/40 rounded-full blur-[120px] animate-pulse"></div>
+        <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-blue-200/40 rounded-full blur-[120px] animate-pulse" style={{animationDelay: '2s'}}></div>
+        <div className="absolute top-[20%] right-[20%] w-[30%] h-[30%] bg-pink-200/30 rounded-full blur-[100px] animate-pulse" style={{animationDelay: '4s'}}></div>
+      </div>
+
+       {/* ERROR TOAST */}
        {errorMsg && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 bg-red-500 text-white px-4 py-2 rounded-full flex items-center gap-2 text-sm shadow-xl animate-in fade-in slide-in-from-top-4">
-          <AlertCircle size={16} /> {errorMsg} <button onClick={() => setErrorMsg(null)} className="ml-2 hover:bg-white/20 rounded-full p-0.5"><X size={14} /></button>
+        <div className="absolute top-6 left-1/2 -translate-x-1/2 z-50 bg-white/90 backdrop-blur-md border border-red-100 text-red-600 px-6 py-3 rounded-full flex items-center gap-3 text-sm shadow-xl shadow-red-500/10 animate-in fade-in slide-in-from-top-4">
+          <AlertCircle size={18} /> <span className="font-medium">{errorMsg}</span> 
+          <button onClick={() => setErrorMsg(null)} className="ml-2 hover:bg-red-50 rounded-full p-1 transition-colors"><X size={14} /></button>
         </div>
       )}
 
+      {/* LOADING OVERLAY */}
       {loading.active && (
-        <div className="absolute inset-0 z-50 bg-white/80 backdrop-blur-md flex flex-col items-center justify-center text-slate-800">
-          <div className="relative">
-            <Loader2 size={48} className="animate-spin text-indigo-600" />
-            <div className="absolute inset-0 flex items-center justify-center"> <div className="w-2 h-2 bg-indigo-600 rounded-full animate-pulse"></div> </div>
+        <div className="absolute inset-0 z-50 bg-white/80 backdrop-blur-md flex flex-col items-center justify-center">
+          <div className="relative mb-6">
+             <div className="absolute inset-0 bg-indigo-500/20 blur-xl rounded-full"></div>
+             <Loader2 size={56} className="animate-spin text-indigo-600 relative z-10" strokeWidth={1.5} />
           </div>
-          <p className="mt-4 font-bold text-lg tracking-wide text-indigo-900">{loading.message}</p>
-          {loading.subtext && <p className="text-slate-500 text-sm mt-1">{loading.subtext}</p>}
-          <div className="w-64 h-1.5 bg-gray-200 rounded-full mt-4 overflow-hidden">
-             <div className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-300 ease-out" style={{ width: `${loading.progress}%` }}></div>
+          <p className="font-bold text-2xl tracking-tight text-slate-900 mb-2">{loading.message}</p>
+          {loading.subtext && <p className="text-slate-500 font-medium">{loading.subtext}</p>}
+          <div className="w-72 h-1.5 bg-slate-200 rounded-full mt-8 overflow-hidden">
+             <div className="h-full bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 transition-all duration-300 ease-out" style={{ width: `${loading.progress}%` }}></div>
           </div>
         </div>
       )}
 
+      {/* EXPORT SUMMARY */}
       {exportSummary && exportSummary.show && (
-         <div className="absolute inset-0 z-50 bg-white/90 backdrop-blur-md flex items-center justify-center p-4">
-             <div className="bg-white border border-gray-100 rounded-3xl p-8 max-w-md w-full shadow-2xl shadow-indigo-200/50 relative overflow-hidden">
-                 <div className="absolute top-0 inset-x-0 h-2 bg-gradient-to-r from-green-400 to-emerald-500"></div>
+         <div className="absolute inset-0 z-50 bg-white/90 backdrop-blur-xl flex items-center justify-center p-4">
+             <div className="bg-white border border-slate-100 rounded-[2rem] p-10 max-w-md w-full shadow-2xl shadow-indigo-500/10 relative overflow-hidden transform transition-all animate-in zoom-in-95 duration-300">
                  <div className="flex flex-col items-center text-center">
-                     <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mb-4 text-green-600 ring-4 ring-green-50"> <CheckCircle2 size={32} /> </div>
-                     <h3 className="text-2xl font-bold text-slate-900 mb-2">Export Complete!</h3>
-                     <p className="text-slate-500 text-sm mb-6">Your video has been enhanced and saved.</p>
-                     <div className="w-full bg-slate-50 rounded-xl p-4 mb-6 space-y-3 border border-slate-100">
-                         <div className="flex justify-between text-sm"> <span className="text-slate-500">Filename</span> <span className="text-slate-900 font-mono text-xs truncate max-w-[180px]">{exportSummary.filename}</span> </div>
-                         <div className="flex justify-between text-sm"> <span className="text-slate-500">Size</span> <span className="text-slate-900 font-mono text-xs">{exportSummary.size}</span> </div>
-                         <div className="flex justify-between text-sm"> <span className="text-slate-500">Duration</span> <span className="text-slate-900 font-mono text-xs">{exportSummary.duration}</span> </div>
-                         <div className="flex justify-between text-sm"> <span className="text-slate-500">Resolution</span> <span className="text-slate-900 font-mono text-xs">{exportSummary.resolution}</span> </div>
+                     <div className="w-20 h-20 bg-green-50 rounded-full flex items-center justify-center mb-6 text-green-500 ring-8 ring-green-50/50"> <CheckCircle2 size={40} strokeWidth={1.5} /> </div>
+                     <h3 className="text-3xl font-bold text-slate-900 mb-2 tracking-tight">Export Complete!</h3>
+                     <p className="text-slate-500 mb-8">Your video has been exported.</p>
+                     <div className="w-full bg-slate-50 rounded-2xl p-5 mb-8 space-y-4 border border-slate-100/50">
+                         <div className="flex justify-between items-center text-sm"> <span className="text-slate-400 font-medium">Filename</span> <span className="text-slate-700 font-bold truncate max-w-[180px]">{exportSummary.filename}</span> </div>
+                         <div className="flex justify-between items-center text-sm"> <span className="text-slate-400 font-medium">Size</span> <span className="text-slate-700 font-bold">{exportSummary.size}</span> </div>
+                         <div className="flex justify-between items-center text-sm"> <span className="text-slate-400 font-medium">Duration</span> <span className="text-slate-700 font-bold">{exportSummary.duration}</span> </div>
+                         <div className="flex justify-between items-center text-sm"> <span className="text-slate-400 font-medium">Resolution</span> <span className="text-slate-700 font-bold">{exportSummary.resolution}</span> </div>
                      </div>
-                     <button onClick={() => setExportSummary(null)} className="w-full py-3 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-600/20"> Process Another Video </button>
+                     <button onClick={() => setExportSummary(null)} className="w-full py-4 bg-slate-900 text-white font-bold rounded-2xl hover:bg-slate-800 transition-all shadow-lg shadow-slate-900/20 active:scale-95"> Process Another Video </button>
                  </div>
              </div>
          </div>
       )}
 
+      {/* MAIN CONTENT */}
       {step === 'upload' ? (
-        <div className="flex-1 flex flex-col items-center justify-center p-8 text-center animate-in fade-in duration-500 bg-gradient-to-b from-indigo-50/50 to-white">
+        <div className="flex-1 flex flex-col items-center justify-center p-8 relative z-10">
+             <div className="text-center mb-12">
+                 <h1 className="text-6xl font-black text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-purple-600 mb-4 tracking-tight pb-2">Video Player.</h1>
+                 <p className="text-xl text-slate-500 max-w-lg mx-auto leading-relaxed">Upload and play your high-quality videos.</p>
+             </div>
+             
              <div 
-                className="w-full max-w-2xl aspect-[21/9] border-2 border-dashed border-indigo-200 rounded-3xl bg-white flex flex-col items-center justify-center cursor-pointer hover:border-indigo-400 hover:bg-indigo-50/30 transition-all group relative overflow-hidden shadow-sm hover:shadow-md"
+                className="w-full max-w-2xl aspect-video bg-white/60 backdrop-blur-xl border-2 border-dashed border-indigo-200 rounded-[2rem] flex flex-col items-center justify-center cursor-pointer hover:border-indigo-500 hover:bg-white/80 transition-all duration-300 group shadow-2xl shadow-indigo-100/50"
                 onClick={() => fileInputRef.current?.click()}
              >
-                <div className="p-5 bg-indigo-50 rounded-full mb-4 group-hover:scale-110 transition-transform duration-300 relative z-10 text-indigo-500">
-                    <Upload size={32} />
+                <div className="w-20 h-20 bg-white rounded-full flex items-center justify-center mb-6 shadow-xl shadow-indigo-100 group-hover:scale-110 transition-transform duration-300">
+                    <Upload size={32} className="text-indigo-600" />
                 </div>
-                <h3 className="text-xl font-bold text-slate-800 mb-2 relative z-10">Select a video to enhance</h3>
-                <p className="text-slate-500 text-sm max-w-xs relative z-10">Supports MP4, WebM, MOV. Up to 2GB.</p>
+                <h3 className="text-2xl font-bold text-slate-800 mb-2">Drop your video here</h3>
+                <p className="text-slate-500 font-medium">MP4, WebM, MOV &middot; Up to 2GB</p>
                 <input ref={fileInputRef} type="file" accept="video/mp4,video/webm,video/quicktime" className="hidden" onChange={handleFileChange} />
              </div>
         </div>
       ) : (
         <>
-            <div className="flex-none px-4 md:px-6 py-3 border-b border-gray-200 flex items-center justify-between bg-white/80 backdrop-blur-sm z-30">
-                <div className="flex items-center gap-4">
-                     {step === 'enhanced' && (
-                         <button onClick={() => { setStep('original'); setActiveFeature('none'); setIsEnhanced(false); }} className="text-slate-500 hover:text-slate-800 flex items-center gap-2 text-xs font-bold px-3 py-1.5 rounded-lg hover:bg-slate-100 transition-all"> <Undo2 size={14}/> Revert </button>
-                     )}
-                     <div className="h-4 w-px bg-gray-200 mx-2"></div>
-                     <h3 className="text-sm font-semibold text-slate-700 truncate max-w-[200px]">{originalFileName}</h3>
+            {/* HEADER */}
+            <div className="flex-none px-8 py-6 flex items-center justify-between z-30 pointer-events-none">
+                <div className="pointer-events-auto bg-white/80 backdrop-blur-md px-4 py-2 rounded-full border border-white/20 shadow-sm flex items-center gap-3">
+                     <button 
+                        onClick={() => { 
+                             setVideoSrc(null); setStep('upload'); setOriginalFileName('video');
+                        }} 
+                        className="text-slate-400 hover:text-slate-900 transition-colors p-1"
+                        title="Back"
+                     > 
+                        <Undo2 size={20}/> 
+                     </button>
+                     
+                     <div className="h-4 w-px bg-slate-200"></div>
+                     <span className="text-sm font-bold text-slate-700 truncate max-w-[200px]">{originalFileName}</span>
                 </div>
-                <div className="flex items-center gap-2">
-                     <button onClick={() => handleQuickExport()} className="flex items-center gap-2 bg-indigo-600 text-white px-4 py-1.5 rounded-lg text-xs font-bold hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-600/20"> <Download size={14} /> Download HD </button>
+                
+                <div className="pointer-events-auto relative">
+                     <button 
+                        onClick={() => setShowExportMenu(!showExportMenu)}
+                        className="flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-full text-xs font-bold hover:bg-slate-800 transition-all shadow-lg shadow-slate-900/20 active:scale-95"
+                     > 
+                        <Download size={14} /> Download <ChevronDown size={14} className={showExportMenu ? 'rotate-180 transition-transform' : 'transition-transform'}/>
+                     </button>
+                     
+                     {showExportMenu && (
+                        <div className="absolute top-full right-0 mt-2 w-48 bg-white rounded-2xl shadow-xl border border-slate-100 overflow-hidden animate-in fade-in slide-in-from-top-2 p-1 z-50">
+                            <div className="text-[10px] font-bold text-slate-400 px-3 py-2 uppercase tracking-wider">Export Resolution</div>
+                            <button onClick={() => startExportProcess('original')} className="w-full text-left px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex items-center justify-between">
+                                <span>Original</span> <MonitorPlay size={12} className="text-slate-400"/>
+                            </button>
+                            <button onClick={() => startExportProcess('4k')} className="w-full text-left px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex items-center justify-between">
+                                <span>4K Ultra HD</span> <span className="text-[10px] bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded">UHD</span>
+                            </button>
+                            <button onClick={() => startExportProcess('2k')} className="w-full text-left px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex items-center justify-between">
+                                <span>2K Cinema</span> <span className="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded">2K</span>
+                            </button>
+                            <button onClick={() => startExportProcess('1080p')} className="w-full text-left px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex items-center justify-between">
+                                <span>1080p Full HD</span> <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">FHD</span>
+                            </button>
+                        </div>
+                     )}
                 </div>
             </div>
 
-            <div className="flex-1 relative bg-gray-100/50 flex flex-col items-center justify-center overflow-hidden">
-                 <div className="relative w-full h-full flex items-center justify-center max-h-[calc(100vh-160px)] p-4">
+            {/* STAGE */}
+            <div 
+                className="flex-1 relative flex flex-col items-center justify-center overflow-hidden pb-32 z-10"
+                onMouseDown={handleMouseDown}
+                onMouseMove={handleMouseMove}
+                onMouseUp={handleMouseUp}
+                onMouseLeave={handleMouseLeave}
+            >
+                 <div className="relative w-full max-w-6xl aspect-video shadow-2xl shadow-indigo-900/20 rounded-2xl overflow-hidden bg-slate-900 group">
                     <video
                         ref={videoRef}
                         src={videoSrc || ''}
@@ -961,100 +820,105 @@ const App: React.FC = () => {
                         playsInline loop muted={isMuted} crossOrigin="anonymous"
                     />
                     
-                    <canvas ref={canvasRef} className="max-w-full max-h-full object-contain shadow-2xl rounded-lg bg-black" />
+                    <canvas ref={canvasRef} className={`w-full h-full object-contain ${zoom > 1 ? 'cursor-grab active:cursor-grabbing' : ''}`} />
                     
-                    <canvas ref={exportCanvasRef} className="hidden" />
+                    {/* Fixed Export Canvas: Opacity 0 but technically visible for filters */}
+                    <canvas ref={exportCanvasRef} className="fixed top-0 left-0 pointer-events-none opacity-0 -z-50" />
 
-                    {step === 'enhanced' && !isEffectEnabled && !isSmoothMode && (
-                        <div className="absolute top-8 right-8 z-10">
-                            <div className="bg-white/90 backdrop-blur-md border border-gray-200 text-slate-800 px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-2 animate-in fade-in shadow-lg">
-                                <Power size={14} className="text-red-500"/> Original
+                    {/* STATUS BADGES & ZOOM CONTROLS */}
+                    <div className="absolute top-6 right-6 flex flex-col gap-3 z-20">
+                         {/* Enhanced Badge */}
+                         {isEnhanced && !isComparing && (
+                            <div className="bg-indigo-600 text-white px-4 py-2 rounded-full text-xs font-bold shadow-lg animate-in fade-in slide-in-from-right-4 flex items-center gap-2 self-end">
+                                <Sparkles size={14} className="text-yellow-300" /> ENHANCED
                             </div>
-                        </div>
-                    )}
-                    
-                    {step === 'enhanced' && (isEffectEnabled || isSmoothMode) && (
-                        <div className="absolute top-8 right-8 flex flex-col gap-2 z-10">
-                            <button
-                                onMouseDown={() => setIsCompareActive(true)}
-                                onMouseUp={() => setIsCompareActive(false)}
-                                onMouseLeave={() => setIsCompareActive(false)}
-                                onTouchStart={() => setIsCompareActive(true)}
-                                onTouchEnd={() => setIsCompareActive(false)}
-                                className="bg-white/90 backdrop-blur-md border border-gray-200 text-slate-800 px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider hover:bg-white transition-all select-none active:scale-95 flex items-center gap-2 shadow-lg"
-                            >
-                                <ScanFace size={14} className="text-indigo-500"/> Hold to Compare
+                        )}
+                        {/* Compare Badge */}
+                         {isComparing && (
+                            <div className="bg-slate-700 text-white px-4 py-2 rounded-full text-xs font-bold shadow-lg animate-in fade-in slide-in-from-right-4 flex items-center gap-2 self-end">
+                                <Eye size={14} className="text-white" /> ORIGINAL VIEW
+                            </div>
+                        )}
+
+                        {/* Zoom Controls */}
+                        <div className="bg-black/40 backdrop-blur-md rounded-2xl p-2 flex flex-col gap-2 border border-white/10 mt-4 transition-opacity duration-300 opacity-0 group-hover:opacity-100 self-end">
+                            <button onClick={handleZoomIn} className="w-10 h-10 flex items-center justify-center text-white hover:bg-white/20 rounded-xl transition-colors active:scale-95" title="Zoom In">
+                                <ZoomIn size={20} />
                             </button>
-                            {isCompareActive && (
-                                <div className="absolute top-12 right-0 bg-indigo-600 text-white text-[10px] font-bold px-2 py-1 rounded shadow-lg animate-in fade-in zoom-in"> SHOWING ORIGINAL </div>
+                            <button onClick={handleZoomReset} className="w-10 h-10 flex items-center justify-center text-white hover:bg-white/20 rounded-xl transition-colors active:scale-95" title="Reset Zoom">
+                                <RotateCcw size={18} />
+                            </button>
+                            <button onClick={handleZoomOut} className="w-10 h-10 flex items-center justify-center text-white hover:bg-white/20 rounded-xl transition-colors active:scale-95" title="Zoom Out">
+                                <ZoomOut size={20} />
+                            </button>
+                            {zoom > 1 && (
+                                <div className="w-10 h-10 flex items-center justify-center text-indigo-400 animate-pulse">
+                                     <Move size={18} />
+                                </div>
                             )}
                         </div>
-                    )}
+                    </div>
                  </div>
             </div>
 
-            {/* CONTROLS BELOW VIDEO - LIGHT THEME */}
-            <div className="flex-none bg-white border-t border-gray-200 p-4 flex flex-col gap-3 z-20 shadow-lg shadow-gray-200/50">
-                <div className="flex items-center gap-4 w-full max-w-4xl mx-auto">
-                    <button onClick={togglePlay} className="w-10 h-10 flex-none flex items-center justify-center text-white hover:bg-indigo-700 transition-colors bg-indigo-600 rounded-full shadow-md shadow-indigo-600/20">
-                        {mode === ProcessingMode.PLAYING ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
-                    </button>
+            {/* FLOATING CONTROL DECK */}
+            <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-40 w-full max-w-3xl px-4">
+                <div className="bg-white/80 backdrop-blur-xl border border-white/40 rounded-[2rem] p-4 shadow-2xl shadow-indigo-500/15 flex flex-col gap-4">
                     
-                    <div className="flex-1 flex flex-col justify-center">
+                    {/* TOP ROW: TIMELINE */}
+                    <div className="flex items-center gap-4 px-2">
+                        <span className="text-xs font-mono font-bold text-slate-400 w-12 text-right">{formatTime(currentTime)}</span>
                          <input
                             type="range"
                             min={0}
                             max={duration || 100}
                             value={currentTime}
                             onChange={handleSeek}
-                            className="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 hover:h-2 transition-all"
+                            className="flex-1 h-2 bg-slate-200 rounded-full appearance-none cursor-pointer accent-indigo-600"
                             style={{
                                 backgroundSize: `${(currentTime / (duration || 1)) * 100}% 100%`,
-                                background: `linear-gradient(to right, #4f46e5 ${(currentTime / (duration || 1)) * 100}%, #e5e7eb ${(currentTime / (duration || 1)) * 100}%)`
+                                background: `linear-gradient(to right, #4f46e5 ${(currentTime / (duration || 1)) * 100}%, #e2e8f0 ${(currentTime / (duration || 1)) * 100}%)`
                             }}
                         />
-                    </div>
-                    
-                    <div className="text-xs font-mono font-bold text-slate-500 select-none w-24 text-right">
-                        <span>{formatTime(currentTime)}</span> / <span>{formatTime(duration)}</span>
+                        <span className="text-xs font-mono font-bold text-slate-400 w-12">{formatTime(duration)}</span>
                     </div>
 
-                    <button onClick={toggleMute} className="text-slate-400 hover:text-indigo-600 transition-colors p-2 hover:bg-indigo-50 rounded-full">
-                        {isMuted ? <VolumeX size={18}/> : <Volume2 size={18}/>}
-                    </button>
-                    
-                    {/* ENHANCEMENT CONTROLS */}
-                    {step === 'enhanced' && (
-                        <div className="flex items-center gap-3 pl-6 border-l border-gray-200 ml-2">
-                             <button 
-                                onClick={handleSmoothToggle}
-                                className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold transition-all border ${isSmoothMode ? 'bg-cyan-50 border-cyan-200 text-cyan-700 shadow-sm' : 'bg-white border-gray-200 text-slate-500 hover:text-slate-800 hover:border-gray-300'}`}
-                                title="Reduce roughness and noise"
-                            >
-                                <Feather size={14} className={isSmoothMode ? "text-cyan-600" : ""} /> 
-                                <span>Smooth</span>
+                    {/* BOTTOM ROW: ACTIONS */}
+                    <div className="flex items-center justify-between px-2">
+                         <div className="flex items-center gap-2 w-1/3">
+                            <button onClick={toggleMute} className="w-10 h-10 flex items-center justify-center rounded-full hover:bg-slate-100 text-slate-500 transition-colors">
+                                {isMuted ? <VolumeX size={20}/> : <Volume2 size={20}/>}
                             </button>
-                            
-                             <button 
-                                onClick={() => setIsEffectEnabled(!isEffectEnabled)}
-                                className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold transition-all border ${isEffectEnabled ? 'bg-indigo-50 border-indigo-200 text-indigo-700 shadow-sm' : 'bg-white border-gray-200 text-slate-500 hover:text-slate-800 hover:border-gray-300'}`}
-                                title="Toggle Enhancement"
-                            >
-                                <Power size={14} className={isEffectEnabled ? "text-indigo-600" : ""} /> 
-                                <span>Magic Enhance</span>
-                            </button>
-                        </div>
-                    )}
+                         </div>
 
-                    {step === 'original' && (
-                         <button
-                            onClick={handleStartEnhancement}
-                            className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-xs font-bold uppercase tracking-wider rounded-xl shadow-lg shadow-indigo-600/20 transition-all transform hover:scale-105 ml-2"
-                         >
-                            <Wand2 size={14} className="animate-pulse" />
-                            <span>Magic Enhance</span>
-                         </button>
-                    )}
+                         <div className="flex items-center justify-center w-1/3">
+                            <button onClick={togglePlay} className="w-14 h-14 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full flex items-center justify-center shadow-lg shadow-indigo-600/30 transition-all active:scale-95">
+                                {mode === ProcessingMode.PLAYING ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" className="ml-1"/>}
+                            </button>
+                         </div>
+
+                         <div className="flex items-center justify-end gap-3 w-1/3">
+                            {/* Compare Button - Visible only when Enhanced */}
+                            {isEnhanced && (
+                                <button
+                                    onMouseDown={() => setIsComparing(true)}
+                                    onMouseUp={() => setIsComparing(false)}
+                                    onMouseLeave={() => setIsComparing(false)}
+                                    className="w-10 h-10 flex items-center justify-center rounded-full bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 transition-colors active:scale-95 border border-slate-200"
+                                    title="Hold to Compare Original"
+                                >
+                                    <SplitSquareHorizontal size={18} />
+                                </button>
+                            )}
+                         
+                            <button 
+                                onClick={toggleEnhance}
+                                className={`flex items-center gap-2 px-5 py-2.5 rounded-full font-bold text-sm transition-all shadow-lg active:scale-95 ${isEnhanced ? 'bg-gradient-to-r from-pink-500 to-indigo-500 text-white shadow-indigo-500/30' : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'}`}
+                            >
+                                <Wand2 size={16} /> Enhance
+                            </button>
+                         </div>
+                    </div>
                 </div>
             </div>
         </>
