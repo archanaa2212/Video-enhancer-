@@ -1,0 +1,5 @@
+{
+  "name": "Video Quality Enhancer",
+  "description": "Enhance your video quality using AI. Upload a video and let Gemini generate an improved version.",
+  "requestFramePermissions": []
+}
