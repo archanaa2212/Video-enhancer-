@@ -1,67 +1,193 @@
-import React, { useRef, useEffect, useState } from 'react';
-import { FilterState, ProcessingMode, ExportConfig } from './types';
-import { Upload, Play, Pause, Download, Loader2, Undo2, Volume2, VolumeX, AlertCircle, X, CheckCircle2, ZoomIn, ZoomOut, RotateCcw, Move, Wand2, Sparkles, ChevronDown, MonitorPlay, SplitSquareHorizontal, Eye } from 'lucide-react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { ProcessingMode } from './types';
+import { Upload, Play, Pause, Download, Loader2, Undo2, Volume2, VolumeX, AlertCircle, X, CheckCircle2, ZoomIn, ZoomOut, RotateCcw, Wand2, Sparkles, ChevronDown, MonitorPlay, SplitSquareHorizontal, Eye, Share2, FileVideo } from 'lucide-react';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
+
+// --- GLSL SHADERS ---
+const VERTEX_SHADER_SOURCE = `
+attribute vec2 a_position;
+attribute vec2 a_texCoord;
+varying vec2 v_texCoord;
+varying vec2 v_rawCoord;
+
+void main() {
+   gl_Position = vec4(a_position, 0.0, 1.0);
+   v_texCoord = a_texCoord;
+   v_rawCoord = a_texCoord;
+}
+`;
+
+const FRAGMENT_SHADER_SOURCE = `
+precision mediump float;
+uniform sampler2D u_image;
+uniform vec2 u_resolution;
+uniform float u_zoom;
+uniform vec2 u_pan;
+uniform bool u_is_enhanced;
+uniform bool u_is_split;
+uniform float u_slider_pos;
+uniform float u_smooth_strength;
+
+varying vec2 v_texCoord;
+varying vec2 v_rawCoord;
+
+// --- Skin Detection (YCbCr) ---
+bool isSkin(vec3 rgb) {
+    float r = rgb.r;
+    float g = rgb.g;
+    float b = rgb.b;
+    float Y  =  0.299*r + 0.587*g + 0.114*b;
+    float Cb = -0.169*r - 0.331*g + 0.500*b + 0.5;
+    float Cr =  0.500*r - 0.419*g - 0.081*b + 0.5;
+    return (Cb > 0.3 && Cb < 0.7 && Cr > 0.3 && Cr < 0.7 && Y > 0.2);
+}
+
+// --- Bilateral Blur (Edge-Preserving) ---
+vec3 bilateralBlur(sampler2D tex, vec2 uv, vec2 texel) {
+    vec3 center = texture2D(tex, uv).rgb;
+    vec3 sum = vec3(0.0);
+    float total = 0.0;
+    // 5x5 Kernel
+    for (int x = -2; x <= 2; x++) {
+        for (int y = -2; y <= 2; y++) {
+            vec2 offset = vec2(float(x), float(y)) * texel;
+            vec3 sample = texture2D(tex, uv + offset).rgb;
+            float diff = length(sample - center);
+            float weight = exp(-(diff * 12.0)); 
+            sum += sample * weight;
+            total += weight;
+        }
+    }
+    return sum / total;
+}
+
+// --- Sharpen ---
+vec3 sharpen(sampler2D tex, vec2 uv, vec2 texel) {
+    vec3 center = texture2D(tex, uv).rgb;
+    vec3 up = texture2D(tex, uv + vec2(0.0, -texel.y)).rgb;
+    vec3 down = texture2D(tex, uv + vec2(0.0, texel.y)).rgb;
+    vec3 left = texture2D(tex, uv + vec2(-texel.x, 0.0)).rgb;
+    vec3 right = texture2D(tex, uv + vec2(texel.x, 0.0)).rgb;
+    return center * 1.4 - (up + down + left + right) * 0.1; 
+}
+
+void main() {
+    vec2 center = vec2(0.5);
+    vec2 uv = (v_texCoord - center) / u_zoom + center - u_pan;
+
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    vec3 color = texture2D(u_image, uv).rgb;
+    vec3 original = color;
+
+    if (u_is_split && v_rawCoord.x > u_slider_pos) {
+        // We draw the line in CSS overlay now for better UI, 
+        // but keep a tiny gap or just render original here.
+        gl_FragColor = vec4(original, 1.0);
+        return;
+    }
+
+    if (u_is_enhanced) {
+        vec2 texel = 1.0 / u_resolution;
+        bool skin = isSkin(color);
+
+        if (skin) {
+            vec3 smoothed = bilateralBlur(u_image, uv, texel);
+            color = mix(color, smoothed, u_smooth_strength);
+        } else {
+            vec3 sharp = sharpen(u_image, uv, texel);
+            color = mix(color, sharp, 0.3);
+        }
+
+        // Color Grading
+        color *= 1.03; // Exposure
+        color = (color - 0.5) * 1.05 + 0.5; // Contrast
+        float gray = dot(color, vec3(0.299, 0.587, 0.114));
+        color = mix(vec3(gray), color, 1.12); // Saturation
+    }
+
+    gl_FragColor = vec4(color, 1.0);
+}
+`;
 
 type AppStep = 'upload' | 'original' | 'enhanced';
 type ResolutionOption = 'original' | '1080p' | '2k' | '4k';
 
+interface GLContext {
+    gl: WebGLRenderingContext;
+    program: WebGLProgram;
+    positionBuffer: WebGLBuffer;
+    texCoordBuffer: WebGLBuffer;
+    texture: WebGLTexture;
+}
+
 const App: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  
+  // Canvas Refs
+  const canvasRef = useRef<HTMLCanvasElement>(null); 
   const exportCanvasRef = useRef<HTMLCanvasElement>(null);
-  const tempCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  
+  // WebGL Context Refs
+  const mainGLRef = useRef<GLContext | null>(null);
+  const exportGLRef = useRef<GLContext | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   
   // State Refs for Render Loop
-  const stepRef = useRef<AppStep>('upload');
   const isEnhancedRef = useRef<boolean>(false);
-  const isComparingRef = useRef<boolean>(false); // Ref for immediate render loop access
+  const isComparingRef = useRef<boolean>(false); 
+  const isSplitViewRef = useRef<boolean>(false); 
+  const sliderPosRef = useRef<number>(0.5); 
   const isExportingRef = useRef<boolean>(false);
   
   // Zoom & Pan Refs
   const zoomRef = useRef<number>(1);
   const panRef = useRef<{x: number, y: number}>({ x: 0, y: 0 });
   
-  // Audio Context Refs
+  // Interaction Refs
+  const isDraggingRef = useRef<boolean>(false);
+  const isDraggingSliderRef = useRef<boolean>(false);
+  const lastMousePosRef = useRef<{x: number, y: number}>({ x: 0, y: 0 });
+  
+  // Audio
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
-  
-  // Rendering Loop Refs
   const animationFrameIdRef = useRef<number | null>(null);
-  const videoCallbackIdRef = useRef<number | null>(null);
   
-  // Workflow State
+  // State
   const [step, setStep] = useState<AppStep>('upload');
   const [isEnhanced, setIsEnhanced] = useState(false);
-  const [isComparing, setIsComparing] = useState(false); // State for UI
+  const [isComparing, setIsComparing] = useState(false); 
+  const [isSplitView, setIsSplitView] = useState(false); 
   
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
-  const [originalFile, setOriginalFile] = useState<File | null>(null); 
   const [originalFileName, setOriginalFileName] = useState<string>('video');
+  const [fileSizeStr, setFileSizeStr] = useState<string>('');
+  
   const [mode, setMode] = useState<ProcessingMode>(ProcessingMode.IDLE);
-  
   const [isMuted, setIsMuted] = useState(false);
-  
-  // Zoom State
   const [zoom, setZoom] = useState<number>(1);
   const [pan, setPan] = useState<{x: number, y: number}>({ x: 0, y: 0 });
-  const isDraggingRef = useRef<boolean>(false);
-  const lastMousePosRef = useRef<{x: number, y: number}>({ x: 0, y: 0 });
+  const [sliderPos, setSliderPosState] = useState(0.5); // For React rendering of handle
   
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-
-  // Export State
   const [showExportMenu, setShowExportMenu] = useState(false);
+  
+  // Save Dialog State
+  const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [exportName, setExportName] = useState('');
+  const [selectedResolution, setSelectedResolution] = useState<ResolutionOption>('original');
 
   // FFmpeg State
   const ffmpegRef = useRef<FFmpeg | null>(null);
   
-  // Export Summary State
   const [exportSummary, setExportSummary] = useState<{
       show: boolean;
       filename: string;
@@ -78,209 +204,383 @@ const App: React.FC = () => {
       subtext?: string;
   }>({ active: false, message: '', progress: 0 });
 
-  // Init temp canvas for fast blur
-  useEffect(() => {
-    if (!tempCanvasRef.current) {
-        tempCanvasRef.current = document.createElement('canvas');
-    }
-  }, []);
-
-  // Sync state to ref for render loop immediately
-  useEffect(() => { stepRef.current = step; }, [step]);
+  // Sync state to refs
   useEffect(() => { isEnhancedRef.current = isEnhanced; }, [isEnhanced]);
   useEffect(() => { isComparingRef.current = isComparing; }, [isComparing]);
-
-  // Sync Zoom/Pan refs
+  useEffect(() => { isSplitViewRef.current = isSplitView; }, [isSplitView]);
   useEffect(() => { zoomRef.current = zoom; }, [zoom]);
   useEffect(() => { panRef.current = pan; }, [pan]);
 
-  // Cleanup
-  useEffect(() => {
-    return () => {
-        isExportingRef.current = false;
-        if (videoSrc) URL.revokeObjectURL(videoSrc);
-        if (videoCallbackIdRef.current && videoRef.current && 'cancelVideoFrameCallback' in videoRef.current) {
-            // @ts-ignore
-            videoRef.current.cancelVideoFrameCallback(videoCallbackIdRef.current);
-        }
-        if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
-    };
-  }, [videoSrc]);
-
-  // Load FFmpeg
-  const loadFFmpeg = async () => {
-    if (ffmpegRef.current) return ffmpegRef.current;
-    
-    const ffmpeg = new FFmpeg();
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-    
-    try {
-        await ffmpeg.load({
-            coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-            wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-        });
-        ffmpegRef.current = ffmpeg;
-        return ffmpeg;
-    } catch (error) {
-        console.error("Failed to load FFmpeg:", error);
-        throw new Error("Failed to load video processing engine. Please check your connection.");
-    }
+  const formatFileSize = (bytes: number) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  // Core Rendering Function
-  const renderToCanvas = (
-      canvas: HTMLCanvasElement, 
-      source: CanvasImageSource, // Can be HTMLVideoElement or ImageBitmap
-      isExport: boolean, 
-      sourceWidth: number,
-      sourceHeight: number,
-      forceW?: number, 
-      forceH?: number, 
-      overrideEnhance?: boolean
-  ) => {
-      const ctx = canvas.getContext('2d', { alpha: false }); 
-      if (!ctx) return;
-      
-      // Determine if we should apply filters. 
-      // Logic: Apply if (Enhanced is ON) AND (We are NOT comparing/peeking original)
-      const shouldApplyFilters = (overrideEnhance !== undefined ? overrideEnhance : isEnhancedRef.current) && !isComparingRef.current;
-      
-      let targetWidth = sourceWidth;
-      let targetHeight = sourceHeight;
+  // --- WEBGL HELPERS ---
+  const initWebGL = (canvas: HTMLCanvasElement): GLContext | null => {
+      const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true });
+      if (!gl) return null;
 
-      if (forceW && forceH) {
-          targetWidth = forceW;
-          targetHeight = forceH;
-      } else {
-          if (!isExport) {
-             const MAX_PREVIEW_WIDTH = 1920; 
-             if (targetWidth > MAX_PREVIEW_WIDTH) {
-                 const ratio = MAX_PREVIEW_WIDTH / targetWidth;
-                 targetWidth = MAX_PREVIEW_WIDTH;
-                 targetHeight = targetHeight * ratio;
-             }
+      const createShader = (type: number, source: string) => {
+          const shader = gl.createShader(type);
+          if (!shader) return null;
+          gl.shaderSource(shader, source);
+          gl.compileShader(shader);
+          if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+              console.error(gl.getShaderInfoLog(shader));
+              gl.deleteShader(shader);
+              return null;
           }
-      }
-      
-      targetWidth = Math.floor(targetWidth);
-      targetHeight = Math.floor(targetHeight);
-      
-      // Ensure dimensions are even for video encoding requirements (FFmpeg likes evens)
-      if (targetWidth % 2 !== 0) targetWidth--;
-      if (targetHeight % 2 !== 0) targetHeight--;
+          return shader;
+      };
 
-      if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
-          canvas.width = targetWidth;
-          canvas.height = targetHeight;
-      }
-      
-      ctx.save();
-      
-      // ZOOM & PAN TRANSFORM (Preview Only)
-      if (!isExport) {
-          ctx.fillStyle = '#0f172a';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
+      const vs = createShader(gl.VERTEX_SHADER, VERTEX_SHADER_SOURCE);
+      const fs = createShader(gl.FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE);
+      if (!vs || !fs) return null;
 
-          const z = zoomRef.current;
-          const p = panRef.current;
-          
-          ctx.translate(canvas.width / 2, canvas.height / 2);
-          ctx.scale(z, z);
-          ctx.translate(-canvas.width / 2 + p.x, -canvas.height / 2 + p.y);
-      }
+      const program = gl.createProgram();
+      if (!program) return null;
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      gl.linkProgram(program);
 
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
 
-      // --- FILTER PIPELINE ---
-      if (shouldApplyFilters) {
-          if (tempCanvasRef.current) {
-              const downsampleFactor = 2;
-              const tempW = Math.max(64, Math.floor(canvas.width / downsampleFactor));
-              const tempH = Math.max(64, Math.floor(canvas.height / downsampleFactor));
+      const positionBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0]), gl.STATIC_DRAW);
 
-              if (tempCanvasRef.current.width !== tempW || tempCanvasRef.current.height !== tempH) {
-                  tempCanvasRef.current.width = tempW;
-                  tempCanvasRef.current.height = tempH;
-              }
+      const texCoordBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0]), gl.STATIC_DRAW);
 
-              const tCtx = tempCanvasRef.current.getContext('2d', { alpha: false });
-              if (tCtx) {
-                  tCtx.drawImage(source, 0, 0, tempW, tempH);
-                  tCtx.filter = 'blur(8px)'; 
-                  tCtx.drawImage(tempCanvasRef.current, 0, 0, tempW, tempH);
-                  tCtx.filter = 'none';
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-                  // 1. Base Layer
-                  ctx.filter = 'saturate(115%) brightness(108%)';
-                  ctx.drawImage(tempCanvasRef.current, 0, 0, canvas.width, canvas.height);
-                  ctx.filter = 'none';
-
-                  // 2. Luma/Detail
-                  ctx.globalCompositeOperation = 'luminosity';
-                  ctx.filter = 'url(#sharpen-hd) contrast(105%)'; 
-                  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
-                  ctx.filter = 'none';
-                  
-                  // 3. Skin Tone
-                  ctx.globalCompositeOperation = 'soft-light';
-                  ctx.fillStyle = 'rgba(240, 248, 255, 0.18)'; 
-                  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-                  // 4. Glow
-                  ctx.globalCompositeOperation = 'screen';
-                  ctx.globalAlpha = 0.25; 
-                  ctx.drawImage(tempCanvasRef.current, 0, 0, canvas.width, canvas.height);
-
-                  // 5. Contrast
-                  ctx.globalCompositeOperation = 'soft-light';
-                  ctx.globalAlpha = 0.25; 
-                  ctx.drawImage(tempCanvasRef.current, 0, 0, canvas.width, canvas.height);
-
-                  // 6. Clarity
-                  ctx.globalCompositeOperation = 'overlay';
-                  ctx.globalAlpha = 0.15;
-                  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
-
-                  ctx.globalAlpha = 1.0;
-                  ctx.globalCompositeOperation = 'source-over';
-              }
-          } else {
-              ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
-          }
-      } else {
-          // Standard Raw Draw (Used for Original View or Compare)
-          ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
-          
-          // If in comparison mode, maybe add a small "Original" badge?
-          if (isComparingRef.current && !isExport) {
-             ctx.fillStyle = "rgba(0,0,0,0.5)";
-             ctx.fillRect(20, 20, 100, 30);
-             ctx.fillStyle = "white";
-             ctx.font = "bold 16px sans-serif";
-             ctx.fillText("ORIGINAL", 30, 41);
-          }
-      }
-      
-      ctx.restore();
+      return { gl, program, positionBuffer: positionBuffer!, texCoordBuffer: texCoordBuffer!, texture: texture! };
   };
 
-  const startRenderLoop = () => {
+  const renderGLFrame = (ctx: GLContext, source: TexImageSource, width: number, height: number, isExport: boolean) => {
+      const { gl, program, positionBuffer, texCoordBuffer, texture } = ctx;
+
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+      gl.viewport(0, 0, width, height);
+      gl.useProgram(program);
+
+      const positionLoc = gl.getAttribLocation(program, 'a_position');
+      gl.enableVertexAttribArray(positionLoc);
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+
+      const texCoordLoc = gl.getAttribLocation(program, 'a_texCoord');
+      gl.enableVertexAttribArray(texCoordLoc);
+      gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+      gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
+
+      gl.uniform2f(gl.getUniformLocation(program, 'u_resolution'), width, height);
+
+      const z = isExport ? 1.0 : zoomRef.current;
+      const p = isExport ? {x:0, y:0} : panRef.current;
+      gl.uniform1f(gl.getUniformLocation(program, 'u_zoom'), z);
+      gl.uniform2f(gl.getUniformLocation(program, 'u_pan'), p.x, p.y);
+
+      const enhanceActive = (isExport || isEnhancedRef.current) && !isComparingRef.current;
+      gl.uniform1i(gl.getUniformLocation(program, 'u_is_enhanced'), enhanceActive ? 1 : 0);
+
+      const splitActive = !isExport && isSplitViewRef.current && isEnhancedRef.current;
+      gl.uniform1i(gl.getUniformLocation(program, 'u_is_split'), splitActive ? 1 : 0);
+      gl.uniform1f(gl.getUniformLocation(program, 'u_slider_pos'), sliderPosRef.current);
+      gl.uniform1f(gl.getUniformLocation(program, 'u_smooth_strength'), 0.35);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+  };
+
+  const startRenderLoop = useCallback(() => {
     if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
-
     const loop = () => {
-      if (videoRef.current && canvasRef.current) {
-        renderToCanvas(
-            canvasRef.current, 
-            videoRef.current, 
-            false, 
-            videoRef.current.videoWidth, 
-            videoRef.current.videoHeight
-        );
+      if (videoRef.current && videoRef.current.readyState >= 2 && canvasRef.current) {
+         if (!mainGLRef.current) mainGLRef.current = initWebGL(canvasRef.current);
+         if (mainGLRef.current) renderGLFrame(mainGLRef.current, videoRef.current, canvasRef.current.width, canvasRef.current.height, false);
       }
       animationFrameIdRef.current = requestAnimationFrame(loop);
     };
     loop();
+  }, []);
+
+  // --- EVENT HANDLERS ---
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    setErrorMsg(null); setExportSummary(null);
+    if (file) {
+      if (videoSrc) URL.revokeObjectURL(videoSrc);
+      const name = file.name.split('.').slice(0, -1).join('.');
+      setOriginalFileName(name);
+      setExportName(name + '_enhanced'); // Default export name
+      setFileSizeStr(formatFileSize(file.size));
+      
+      setLoading({ active: true, message: 'Loading Video', progress: 30, subtext: 'Preparing workspace...' });
+      const url = URL.createObjectURL(file);
+      setVideoSrc(url);
+      setStep('original');
+      setMode(ProcessingMode.IDLE); 
+      setZoom(1); setPan({x: 0, y: 0}); 
+      setIsMuted(false); setIsEnhanced(false); setIsSplitView(false);
+      setCurrentTime(0); setDuration(0);
+      mainGLRef.current = null; exportGLRef.current = null;
+      setTimeout(() => setLoading(prev => ({...prev, active: false})), 1000);
+    }
+    event.target.value = '';
+  };
+
+  const handleMetadataLoaded = () => {
+      if (videoRef.current && canvasRef.current) {
+          canvasRef.current.width = videoRef.current.videoWidth;
+          canvasRef.current.height = videoRef.current.videoHeight;
+          setDuration(videoRef.current.duration);
+      }
+  };
+
+  const handleVideoLoaded = () => {
+     startRenderLoop();
+     try {
+        if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        if (audioCtxRef.current.state === 'suspended') audioCtxRef.current.resume();
+        if (!audioSourceRef.current && videoRef.current) {
+            audioSourceRef.current = audioCtxRef.current.createMediaElementSource(videoRef.current);
+            audioSourceRef.current.connect(audioCtxRef.current.destination);
+        }
+     } catch (e) { console.error("Audio Context Error", e); }
+     videoRef.current?.play().then(() => setMode(ProcessingMode.PLAYING)).catch(() => setMode(ProcessingMode.PAUSED));
+  };
+
+  const togglePlay = (e?: React.MouseEvent) => { e?.stopPropagation(); videoRef.current?.paused ? videoRef.current.play().then(()=>setMode(ProcessingMode.PLAYING)) : (videoRef.current?.pause(), setMode(ProcessingMode.PAUSED)); };
+  const toggleMute = (e?: React.MouseEvent) => { e?.stopPropagation(); if(videoRef.current) { videoRef.current.muted = !videoRef.current.muted; setIsMuted(videoRef.current.muted); }};
+  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => { if(videoRef.current) { videoRef.current.currentTime = Number(e.target.value); setCurrentTime(videoRef.current.currentTime); }};
+  const handleTimeUpdate = () => videoRef.current && setCurrentTime(videoRef.current.currentTime);
+  const toggleEnhance = () => { setIsEnhanced(p => !p); if(isEnhanced) setIsSplitView(false); };
+  
+  const toggleSplitView = () => { 
+      if(!isEnhanced) setIsEnhanced(true); 
+      setIsSplitView(p => !p); 
+      setSliderPos(0.5); 
+  };
+  
+  const setSliderPos = (pos: number) => {
+      const p = Math.max(0, Math.min(1, pos));
+      sliderPosRef.current = p;
+      setSliderPosState(p); // Update state for UI handle
+  };
+
+  const getVideoNormalizedPos = (e: React.MouseEvent | React.TouchEvent) => {
+     if(!canvasRef.current) return 0.5;
+     const rect = canvasRef.current.getBoundingClientRect();
+     const clientX = 'touches' in e ? e.touches[0].clientX : (e as React.MouseEvent).clientX;
+     const x = clientX - rect.left;
+     return Math.max(0, Math.min(1, x / rect.width)); 
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (!canvasRef.current) return;
+    if (isSplitViewRef.current) {
+        const pos = getVideoNormalizedPos(e);
+        // Larger hit area for slider logic
+        if (Math.abs(pos - sliderPosRef.current) < 0.15) {
+             isDraggingSliderRef.current = true; 
+             setSliderPos(pos);
+        } else if (zoomRef.current > 1) {
+             isDraggingRef.current = true; // Pan
+        }
+    } else if (zoomRef.current > 1) {
+        isDraggingRef.current = true;
+    }
+    lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (isDraggingSliderRef.current && isSplitViewRef.current) {
+        setSliderPos(getVideoNormalizedPos(e));
+    } else if (isDraggingRef.current) {
+        const dx = e.clientX - lastMousePosRef.current.x;
+        const dy = e.clientY - lastMousePosRef.current.y;
+        const z = zoomRef.current;
+        setPan({ x: panRef.current.x + (dx/500/z), y: panRef.current.y + (dy/500/z) }); 
+    }
+    if (isDraggingRef.current) {
+       lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+    }
+  };
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (!canvasRef.current) return;
+    const { clientX, clientY } = e.touches[0];
+    if (isSplitViewRef.current) {
+        const pos = getVideoNormalizedPos(e);
+        if (Math.abs(pos - sliderPosRef.current) < 0.15) {
+             isDraggingSliderRef.current = true; 
+             setSliderPos(pos);
+        } else if (zoomRef.current > 1) {
+             isDraggingRef.current = true; 
+        }
+    } else if (zoomRef.current > 1) {
+        isDraggingRef.current = true;
+    }
+    lastMousePosRef.current = { x: clientX, y: clientY };
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (isDraggingSliderRef.current && isSplitViewRef.current) {
+        setSliderPos(getVideoNormalizedPos(e));
+    } else if (isDraggingRef.current) {
+        const { clientX, clientY } = e.touches[0];
+        const dx = clientX - lastMousePosRef.current.x;
+        const dy = clientY - lastMousePosRef.current.y;
+        const z = zoomRef.current;
+        setPan({ x: panRef.current.x + (dx/500/z), y: panRef.current.y + (dy/500/z) }); 
+        lastMousePosRef.current = { x: clientX, y: clientY };
+    }
+  };
+
+  const handleTouchEnd = () => { isDraggingRef.current = false; isDraggingSliderRef.current = false; };
+  const handleMouseUp = () => { isDraggingRef.current = false; isDraggingSliderRef.current = false; };
+
+  // --- EXPORT LOGIC ---
+  const loadFFmpeg = async () => {
+    if (ffmpegRef.current) return ffmpegRef.current;
+    
+    const ffmpeg = new FFmpeg();
+    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm';
+    const workerURL = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js';
+
+    try {
+        const coreBlob = await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript');
+        const wasmBlob = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
+        const workerBlob = new Blob([`import "${workerURL}";`], { type: 'application/javascript' });
+        const workerBlobURL = URL.createObjectURL(workerBlob);
+
+        await ffmpeg.load({ coreURL: coreBlob, wasmURL: wasmBlob, workerURL: workerBlobURL });
+        ffmpegRef.current = ffmpeg;
+        return ffmpeg;
+    } catch (error: any) {
+        console.error("FFmpeg Load Error:", error);
+        if (error.message && (error.message.includes("SharedArrayBuffer") || error.message.includes("is not defined"))) {
+            throw new Error("Export Unavailable: Browser not supported. Please use Chrome/Edge/Firefox on Desktop.");
+        }
+        throw new Error("Failed to load video engine. Please check your connection.");
+    }
+  };
+
+  const initiateExport = (res: ResolutionOption) => {
+      setSelectedResolution(res);
+      setShowExportMenu(false);
+      setShowSaveDialog(true);
+  };
+
+  const executeExport = async () => {
+    if (!videoRef.current || !exportCanvasRef.current) return;
+    const video = videoRef.current;
+    setShowSaveDialog(false);
+    setMode(ProcessingMode.EXPORTING);
+    isExportingRef.current = true;
+    setLoading({ active: true, message: 'Initializing...', progress: 10, subtext: 'Loading engine...' });
+
+    let ffmpeg: FFmpeg;
+    try { 
+        ffmpeg = await loadFFmpeg(); 
+    } catch (e: any) { 
+        setErrorMsg(e.message || "Failed to load FFmpeg."); 
+        isExportingRef.current = false; 
+        setLoading({active:false, message:'', progress:0}); 
+        return; 
+    }
+
+    setLoading({ active: true, message: 'Capturing...', progress: 0, subtext: 'High-quality recording...' });
+
+    let tW = 1920, tH = 1080;
+    const res = selectedResolution;
+    if (res === '4k') { tW = 3840; tH = 2160; }
+    else if (res === '2k') { tW = 2048; tH = 1080; }
+    else if (res === 'original') { tW = video.videoWidth; tH = video.videoHeight; }
+    if (tW % 2 !== 0) tW--; if (tH % 2 !== 0) tH--;
+    
+    exportCanvasRef.current.width = tW;
+    exportCanvasRef.current.height = tH;
+
+    if (!exportGLRef.current) exportGLRef.current = initWebGL(exportCanvasRef.current);
+
+    video.currentTime = 0;
+    await new Promise(r => setTimeout(r, 200));
+
+    // High bitrate capture (80 Mbps) to minimize MediaRecorder artifacts before ffmpeg
+    const stream = exportCanvasRef.current.captureStream(30);
+    const recorder = new MediaRecorder(stream, { 
+        mimeType: 'video/webm;codecs=vp9', 
+        videoBitsPerSecond: 80000000 
+    });
+    
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    
+    const stopPromise = new Promise<void>(resolve => { recorder.onstop = () => resolve(); });
+    recorder.start();
+    
+    try { await video.play(); } catch(e) {}
+
+    const exportLoop = () => {
+        if (!isExportingRef.current) return;
+        if (video.ended) { recorder.stop(); return; }
+        if (exportGLRef.current) renderGLFrame(exportGLRef.current, video, tW, tH, true);
+        const p = (video.currentTime / video.duration) * 100;
+        setLoading(prev => ({ ...prev, progress: Math.min(90, p) }));
+        requestAnimationFrame(exportLoop);
+    };
+    exportLoop();
+
+    await stopPromise;
+    video.pause();
+
+    if (!isExportingRef.current) return;
+
+    setLoading({ active: true, message: 'Encoding...', progress: 95, subtext: 'Creating high-quality MP4...' });
+    
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const inName = 'input.webm';
+    const outName = 'output.mp4';
+    
+    try {
+        await ffmpeg.writeFile(inName, await fetchFile(blob));
+        // High quality encoding parameters: CRF 17 (Visually Lossless), Preset Medium
+        await ffmpeg.exec([
+            '-i', inName, 
+            '-c:v', 'libx264', 
+            '-preset', 'medium', 
+            '-crf', '17', 
+            '-pix_fmt', 'yuv420p', 
+            outName
+        ]);
+        const data = await ffmpeg.readFile(outName);
+        const url = URL.createObjectURL(new Blob([data], { type: 'video/mp4' }));
+        const a = document.createElement('a');
+        a.href = url;
+        // Use user defined filename
+        let dlName = exportName.trim() || 'enhanced_video';
+        if(!dlName.toLowerCase().endsWith('.mp4')) dlName += '.mp4';
+        
+        a.download = dlName;
+        a.click();
+        
+        setExportSummary({ show: true, filename: dlName, size: formatFileSize(data.byteLength as number), duration: formatTime(duration), resolution: `${tW}x${tH}`, fps: 30 });
+        await ffmpeg.deleteFile(inName); await ffmpeg.deleteFile(outName);
+    } catch (e) { setErrorMsg("Encoding failed."); } 
+    finally { setLoading(p => ({...p, active: false})); setMode(ProcessingMode.PAUSED); isExportingRef.current = false; }
   };
 
   const formatTime = (seconds: number) => {
@@ -290,633 +590,224 @@ const App: React.FC = () => {
       return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
-  const getAudioContext = () => {
-      if (!audioCtxRef.current) {
-          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      }
-      if (audioCtxRef.current.state === 'suspended') audioCtxRef.current.resume();
-      return audioCtxRef.current;
-  };
-
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    setErrorMsg(null); 
-    setExportSummary(null);
-
-    if (file) {
-      if (videoSrc) URL.revokeObjectURL(videoSrc);
-      
-      if (file.size > 2 * 1024 * 1024 * 1024) {
-          setErrorMsg("File size exceeds 2GB limit. Please choose a smaller file.");
-          event.target.value = '';
-          return;
-      }
-
-      setOriginalFile(file);
-      const fileNameWithoutExt = file.name.split('.').slice(0, -1).join('.');
-      setOriginalFileName(fileNameWithoutExt);
-      
-      setLoading({ active: true, message: 'Loading Video', progress: 30, subtext: 'Preparing workspace...' });
-
-      const url = URL.createObjectURL(file);
-      setVideoSrc(url);
-      
-      setStep('original');
-      setMode(ProcessingMode.IDLE); 
-      setZoom(1); setPan({x: 0, y: 0}); 
-      setIsMuted(false); 
-      setIsEnhanced(false); 
-      setCurrentTime(0); setDuration(0);
-      
-      if (audioCtxRef.current) {
-          audioCtxRef.current.close().then(() => { audioCtxRef.current = null; audioSourceRef.current = null; });
-      }
-
-      setTimeout(() => setLoading(prev => ({...prev, progress: 100})), 800);
-      setTimeout(() => setLoading(prev => ({...prev, active: false})), 1000);
-    }
-    event.target.value = '';
-  };
-
-  const handleMetadataLoaded = () => {
-      if (videoRef.current) {
-          const vidDuration = videoRef.current.duration;
-          if (vidDuration > 61) {
-              setVideoSrc(null);
-              setStep('upload'); 
-              setLoading({ active: false, message: '', progress: 0 });
-              setErrorMsg("Video length exceeds 1 minute limit. Please choose a shorter video.");
-              return;
-          }
-          setDuration(vidDuration);
-      }
-  };
-
-  const handleTimeUpdate = () => {
-      if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
-  };
-  
-  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-      const time = Number(e.target.value);
-      if (videoRef.current) {
-          videoRef.current.currentTime = time;
-          setCurrentTime(time);
-      }
-  };
-
-  const handleVideoLoaded = () => {
-     startRenderLoop();
-     try {
-        const ctx = getAudioContext();
-        if (!audioSourceRef.current && videoRef.current) {
-            audioSourceRef.current = ctx.createMediaElementSource(videoRef.current);
-            audioSourceRef.current.connect(ctx.destination);
-        }
-     } catch (e) { console.error("Audio Context Init Failed", e); }
-     
-     if (videoRef.current) {
-        const playPromise = videoRef.current.play();
-        if (playPromise !== undefined) {
-            playPromise.then(() => setMode(ProcessingMode.PLAYING))
-                .catch(() => setMode(ProcessingMode.PAUSED));
-        }
-     }
-  };
-
-  const togglePlay = (e?: React.MouseEvent) => {
-    e?.stopPropagation();
-    if (!videoRef.current) return;
-    if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume();
-    
-    if (videoRef.current.paused) {
-      videoRef.current.play()
-        .then(() => setMode(ProcessingMode.PLAYING))
-        .catch(() => setMode(ProcessingMode.PAUSED));
-    } else {
-      videoRef.current.pause();
-      setMode(ProcessingMode.PAUSED);
-    }
-  };
-
-  const toggleMute = (e?: React.MouseEvent) => {
-    e?.stopPropagation();
-    if (!videoRef.current) return;
-    videoRef.current.muted = !videoRef.current.muted;
-    setIsMuted(videoRef.current.muted);
-  };
-  
-  const toggleEnhance = () => setIsEnhanced(prev => !prev);
-
-  // --- ZOOM & PAN HANDLERS ---
-  const handleZoomIn = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const newZoom = Math.min(zoomRef.current + 0.5, 4);
-    setZoom(newZoom);
-    zoomRef.current = newZoom;
-  };
-
-  const handleZoomOut = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const newZoom = Math.max(zoomRef.current - 0.5, 1);
-    setZoom(newZoom);
-    zoomRef.current = newZoom;
-    if (newZoom === 1) {
-        setPan({x: 0, y: 0});
-        panRef.current = {x: 0, y: 0};
-    }
-  };
-
-  const handleZoomReset = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setZoom(1);
-    zoomRef.current = 1;
-    setPan({x: 0, y: 0});
-    panRef.current = {x: 0, y: 0};
-  };
-
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if (zoomRef.current > 1) {
-        isDraggingRef.current = true;
-        lastMousePosRef.current = { x: e.clientX, y: e.clientY };
-    }
-  };
-
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isDraggingRef.current) return;
-    e.preventDefault();
-    const dx = e.clientX - lastMousePosRef.current.x;
-    const dy = e.clientY - lastMousePosRef.current.y;
-    const z = zoomRef.current;
-    
-    const newPan = {
-        x: panRef.current.x + (dx / z),
-        y: panRef.current.y + (dy / z)
-    };
-    
-    setPan(newPan);
-    panRef.current = newPan;
-    lastMousePosRef.current = { x: e.clientX, y: e.clientY };
-  };
-
-  const handleMouseUp = () => {
-    isDraggingRef.current = false;
-  };
-
-  const handleMouseLeave = () => {
-    isDraggingRef.current = false;
-  };
-
-  // --- MEDIA RECORDER + FFMPEG EXPORT LOGIC ---
-  const startExportProcess = async (resolutionChoice: ResolutionOption) => {
-    if (!videoRef.current || !exportCanvasRef.current) return;
-    const video = videoRef.current;
-    
-    setShowExportMenu(false);
-    setMode(ProcessingMode.EXPORTING);
-    isExportingRef.current = true;
-    
-    setLoading({ active: true, message: 'Loading Encoder...', progress: 10, subtext: 'Initializing FFmpeg engine...' });
-
-    // 1. Load FFmpeg
-    let ffmpeg: FFmpeg;
-    try {
-        ffmpeg = await loadFFmpeg();
-    } catch (e) {
-        setErrorMsg("Failed to load FFmpeg. Check internet connection.");
-        setLoading({ active: false, message: '', progress: 0 });
-        setMode(ProcessingMode.PAUSED);
-        isExportingRef.current = false;
-        return;
-    }
-
-    setLoading({ active: true, message: 'Capturing Video...', progress: 0, subtext: 'Recording enhanced output...' });
-
-    // 2. Configure Resolution
-    let targetWidth = 1920;
-    let targetHeight = 1080;
-    const aspect = video.videoWidth / video.videoHeight;
-
-    if (resolutionChoice === '4k') {
-        targetWidth = 3840; targetHeight = 2160;
-    } else if (resolutionChoice === '2k') {
-        targetWidth = 2048; targetHeight = 1080; // Cinema 2K per user request
-    } else if (resolutionChoice === '1080p') {
-        targetWidth = 1920; targetHeight = 1080;
-    } else {
-        targetWidth = video.videoWidth; targetHeight = video.videoHeight;
-    }
-
-    // Adjust for Aspect Ratio
-    if (Math.abs(aspect - (targetWidth / targetHeight)) > 0.05) {
-        targetHeight = Math.round(targetWidth / aspect);
-    }
-    // Ensure Even Dimensions
-    if (targetWidth % 2 !== 0) targetWidth--;
-    if (targetHeight % 2 !== 0) targetHeight--;
-
-    exportCanvasRef.current.width = targetWidth;
-    exportCanvasRef.current.height = targetHeight;
-
-    // 3. Prepare for Recording
-    const wasMuted = video.muted;
-    const originalCurrentTime = video.currentTime;
-    video.muted = false; // Unmute to capture audio if possible (MediaRecorder might capture tab audio only if stream has audio tracks)
-    // Actually, capturing audio from <video> into MediaRecorder via captureStream isn't fully reliable cross-browser. 
-    // We will focus on video capture and mux audio if needed, but MediaRecorder usually handles <canvas> captureStream + AudioTrack.
-    // For simplicity and robustness with FFmpeg, let's capture video visual primarily.
-    
-    video.currentTime = 0;
-    await new Promise(r => setTimeout(r, 200)); // Buffer settlement
-
-    // 4. Setup MediaRecorder
-    const stream = exportCanvasRef.current.captureStream(30); // 30 FPS Capture
-    
-    // Add audio track if available
-    // Note: capturing audio from the video element directly to the stream is tricky.
-    // We'll rely on visual capture for now to ensure stability, or try to create a stream from video and mix.
-    // Simplifying: Silent Video Capture, then we mux original audio? 
-    // Or just let user know audio might be missing in preview capture.
-    // Better: Capture pure video, let FFmpeg merge original audio file if needed.
-    // For now, let's just capture the canvas stream.
-    
-    // Select supported mimeType
-    let mimeType = 'video/webm;codecs=vp9';
-    if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) mimeType = 'video/webm;codecs=vp8';
-    // Some browsers support mp4 direct
-    if (MediaRecorder.isTypeSupported('video/mp4')) mimeType = 'video/mp4';
-
-    const recorder = new MediaRecorder(stream, {
-        mimeType,
-        videoBitsPerSecond: 25000000 // 25 Mbps High Quality
-    });
-
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-    };
-
-    const stopPromise = new Promise<void>(resolve => {
-        recorder.onstop = () => resolve();
-    });
-
-    // 5. Start Recording Loop
-    recorder.start();
-    try {
-        await video.play();
-    } catch (e) {
-        console.error("Play failed during export", e);
-    }
-
-    // Render loop specifically for export
-    const exportRenderLoop = () => {
-        if (!isExportingRef.current) return;
-        if (video.ended) {
-            recorder.stop();
-            return;
-        }
-        
-        renderToCanvas(
-            exportCanvasRef.current!, 
-            video, 
-            true, 
-            video.videoWidth, 
-            video.videoHeight, 
-            targetWidth, 
-            targetHeight
-        );
-        
-        const progress = (video.currentTime / video.duration) * 100;
-        setLoading(prev => ({ ...prev, progress: Math.min(90, progress) })); // Cap at 90 until processing
-        
-        requestAnimationFrame(exportRenderLoop);
-    };
-    exportRenderLoop();
-
-    // Wait for record to finish
-    await stopPromise;
-    video.pause();
-
-    if (!isExportingRef.current) {
-        // User cancelled
-        video.muted = wasMuted;
-        video.currentTime = originalCurrentTime;
-        return;
-    }
-
-    setLoading({ active: true, message: 'Processing Video...', progress: 95, subtext: 'Converting with FFmpeg...' });
-
-    // 6. FFmpeg Processing
-    const blob = new Blob(chunks, { type: mimeType });
-    const fileExt = mimeType.includes('mp4') ? 'mp4' : 'webm';
-    const inputName = `input.${fileExt}`;
-    const outputName = `output.mp4`;
-
-    try {
-        // Write input file
-        await ffmpeg.writeFile(inputName, await fetchFile(blob));
-
-        // Command: Convert to MP4 (H.264). 
-        // -preset ultrafast for speed (WASM is slow)
-        // -crf 23 for quality
-        // -pix_fmt yuv420p for compatibility
-        await ffmpeg.exec([
-            '-i', inputName,
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-crf', '22',
-            '-pix_fmt', 'yuv420p',
-            outputName
-        ]);
-
-        // Read output
-        const data = await ffmpeg.readFile(outputName);
-        const outBlob = new Blob([data], { type: 'video/mp4' });
-        const outUrl = URL.createObjectURL(outBlob);
-
-        // Download
-        const a = document.createElement('a');
-        a.href = outUrl;
-        a.download = `${originalFileName}_enhanced_${resolutionChoice}.mp4`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-
-        setExportSummary({
-            show: true,
-            filename: `${originalFileName}.mp4`,
-            size: `${(outBlob.size / 1024 / 1024).toFixed(2)} MB`,
-            duration: formatTime(duration),
-            resolution: `${targetWidth}x${targetHeight}`,
-            fps: 30
-        });
-
-        // Cleanup FFmpeg files
-        await ffmpeg.deleteFile(inputName);
-        await ffmpeg.deleteFile(outputName);
-
-    } catch (e) {
-        console.error("FFmpeg error", e);
-        setErrorMsg("Video conversion failed. Please try a shorter video or lower resolution.");
-    } finally {
-        video.muted = wasMuted;
-        video.currentTime = originalCurrentTime;
-        setLoading(prev => ({ ...prev, active: false }));
-        setMode(ProcessingMode.PAUSED);
-        isExportingRef.current = false;
-    }
-  };
+  const handleZoomIn = (e: React.MouseEvent) => { e.stopPropagation(); setZoom(z => Math.min(z + 0.5, 4)); };
+  const handleZoomOut = (e: React.MouseEvent) => { e.stopPropagation(); setZoom(z => { const n = Math.max(z - 0.5, 1); if(n===1) setPan({x:0,y:0}); return n; }); };
+  const handleZoomReset = (e: React.MouseEvent) => { e.stopPropagation(); setZoom(1); setPan({x:0,y:0}); };
 
   return (
     <div className="flex flex-col h-screen bg-slate-50 text-slate-800 font-sans overflow-hidden selection:bg-indigo-100 selection:text-indigo-900">
       
-      {/* FILTER DEFINITIONS */}
-      <svg style={{ position: 'absolute', width: 0, height: 0, overflow: 'hidden' }}>
-        <defs>
-          <filter id="sharpen-hd">
-            <feConvolveMatrix 
-              order="3" 
-              kernelMatrix="0 -0.08 0 -0.08 1.32 -0.08 0 -0.08 0" 
-              edgeMode="duplicate"
-              preserveAlpha="true"
-            />
-          </filter>
-        </defs>
-      </svg>
-
-      {/* BACKGROUND ELEMENTS */}
+      {/* BACKGROUND */}
       <div className="fixed inset-0 z-0 pointer-events-none opacity-60">
         <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-purple-200/40 rounded-full blur-[120px] animate-pulse"></div>
         <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-blue-200/40 rounded-full blur-[120px] animate-pulse" style={{animationDelay: '2s'}}></div>
-        <div className="absolute top-[20%] right-[20%] w-[30%] h-[30%] bg-pink-200/30 rounded-full blur-[100px] animate-pulse" style={{animationDelay: '4s'}}></div>
       </div>
-
+       
        {/* ERROR TOAST */}
        {errorMsg && (
-        <div className="absolute top-6 left-1/2 -translate-x-1/2 z-50 bg-white/90 backdrop-blur-md border border-red-100 text-red-600 px-6 py-3 rounded-full flex items-center gap-3 text-sm shadow-xl shadow-red-500/10 animate-in fade-in slide-in-from-top-4">
-          <AlertCircle size={18} /> <span className="font-medium">{errorMsg}</span> 
-          <button onClick={() => setErrorMsg(null)} className="ml-2 hover:bg-red-50 rounded-full p-1 transition-colors"><X size={14} /></button>
+        <div className="fixed top-6 left-4 right-4 md:left-1/2 md:-translate-x-1/2 z-50 bg-white/95 backdrop-blur-md border border-red-100 text-red-600 px-4 py-3 rounded-2xl flex items-start gap-3 text-sm shadow-xl animate-in fade-in slide-in-from-top-4">
+          <AlertCircle size={18} className="mt-0.5 shrink-0" /> 
+          <span className="font-medium flex-1">{errorMsg}</span> 
+          <button onClick={() => setErrorMsg(null)} className="hover:bg-red-50 rounded-full p-1"><X size={14} /></button>
         </div>
       )}
 
       {/* LOADING OVERLAY */}
       {loading.active && (
-        <div className="absolute inset-0 z-50 bg-white/80 backdrop-blur-md flex flex-col items-center justify-center">
-          <div className="relative mb-6">
-             <div className="absolute inset-0 bg-indigo-500/20 blur-xl rounded-full"></div>
-             <Loader2 size={56} className="animate-spin text-indigo-600 relative z-10" strokeWidth={1.5} />
-          </div>
-          <p className="font-bold text-2xl tracking-tight text-slate-900 mb-2">{loading.message}</p>
-          {loading.subtext && <p className="text-slate-500 font-medium">{loading.subtext}</p>}
-          <div className="w-72 h-1.5 bg-slate-200 rounded-full mt-8 overflow-hidden">
-             <div className="h-full bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 transition-all duration-300 ease-out" style={{ width: `${loading.progress}%` }}></div>
+        <div className="absolute inset-0 z-50 bg-white/80 backdrop-blur-md flex flex-col items-center justify-center p-4 text-center">
+          <Loader2 size={48} className="animate-spin text-indigo-600 mb-6" strokeWidth={1.5} />
+          <p className="font-bold text-xl text-slate-900 mb-2">{loading.message}</p>
+          <p className="text-slate-500 text-sm font-medium">{loading.subtext}</p>
+          <div className="w-64 h-1.5 bg-slate-200 rounded-full mt-6 overflow-hidden">
+             <div className="h-full bg-indigo-500 transition-all duration-300" style={{ width: `${loading.progress}%` }}></div>
           </div>
         </div>
       )}
 
-      {/* EXPORT SUMMARY */}
+      {/* SAVE AS DIALOG */}
+      {showSaveDialog && (
+          <div className="absolute inset-0 z-50 bg-black/20 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className="bg-white rounded-[2rem] p-6 w-full max-w-sm shadow-2xl animate-in zoom-in-95">
+                  <h3 className="text-xl font-bold text-slate-900 mb-4">Export Settings</h3>
+                  
+                  <label className="block text-sm font-bold text-slate-500 mb-2">Filename</label>
+                  <input 
+                    type="text" 
+                    value={exportName} 
+                    onChange={(e) => setExportName(e.target.value)} 
+                    className="w-full bg-slate-100 border-none rounded-xl px-4 py-3 text-slate-900 font-medium focus:ring-2 focus:ring-indigo-500 outline-none mb-4"
+                    placeholder="Enter filename"
+                  />
+
+                  <div className="bg-slate-50 rounded-xl p-3 mb-6">
+                      <div className="flex justify-between text-sm mb-1">
+                          <span className="text-slate-500">Quality</span>
+                          <span className="font-bold text-indigo-600">High (CRF 17)</span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                          <span className="text-slate-500">Resolution</span>
+                          <span className="font-bold text-slate-800 uppercase">{selectedResolution}</span>
+                      </div>
+                  </div>
+
+                  <div className="flex gap-3">
+                      <button onClick={() => setShowSaveDialog(false)} className="flex-1 py-3 bg-slate-100 text-slate-600 font-bold rounded-xl hover:bg-slate-200 transition-colors">Cancel</button>
+                      <button onClick={executeExport} className="flex-1 py-3 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-600/20">Save Video</button>
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* EXPORT SUCCESS MODAL */}
       {exportSummary && exportSummary.show && (
          <div className="absolute inset-0 z-50 bg-white/90 backdrop-blur-xl flex items-center justify-center p-4">
-             <div className="bg-white border border-slate-100 rounded-[2rem] p-10 max-w-md w-full shadow-2xl shadow-indigo-500/10 relative overflow-hidden transform transition-all animate-in zoom-in-95 duration-300">
-                 <div className="flex flex-col items-center text-center">
-                     <div className="w-20 h-20 bg-green-50 rounded-full flex items-center justify-center mb-6 text-green-500 ring-8 ring-green-50/50"> <CheckCircle2 size={40} strokeWidth={1.5} /> </div>
-                     <h3 className="text-3xl font-bold text-slate-900 mb-2 tracking-tight">Export Complete!</h3>
-                     <p className="text-slate-500 mb-8">Your video has been exported.</p>
-                     <div className="w-full bg-slate-50 rounded-2xl p-5 mb-8 space-y-4 border border-slate-100/50">
-                         <div className="flex justify-between items-center text-sm"> <span className="text-slate-400 font-medium">Filename</span> <span className="text-slate-700 font-bold truncate max-w-[180px]">{exportSummary.filename}</span> </div>
-                         <div className="flex justify-between items-center text-sm"> <span className="text-slate-400 font-medium">Size</span> <span className="text-slate-700 font-bold">{exportSummary.size}</span> </div>
-                         <div className="flex justify-between items-center text-sm"> <span className="text-slate-400 font-medium">Duration</span> <span className="text-slate-700 font-bold">{exportSummary.duration}</span> </div>
-                         <div className="flex justify-between items-center text-sm"> <span className="text-slate-400 font-medium">Resolution</span> <span className="text-slate-700 font-bold">{exportSummary.resolution}</span> </div>
-                     </div>
-                     <button onClick={() => setExportSummary(null)} className="w-full py-4 bg-slate-900 text-white font-bold rounded-2xl hover:bg-slate-800 transition-all shadow-lg shadow-slate-900/20 active:scale-95"> Process Another Video </button>
-                 </div>
+             <div className="bg-white border border-slate-100 rounded-[2rem] p-8 max-w-sm w-full shadow-2xl relative animate-in zoom-in-95 flex flex-col items-center text-center">
+                 <CheckCircle2 size={56} className="text-green-500 mb-4" />
+                 <h3 className="text-2xl font-bold text-slate-900 mb-2">Saved!</h3>
+                 <p className="text-slate-500 mb-1 text-sm">{exportSummary.filename}</p>
+                 <p className="text-slate-400 mb-6 text-xs">{exportSummary.size} • {exportSummary.resolution}</p>
+                 <button onClick={() => setExportSummary(null)} className="w-full py-3.5 bg-slate-900 text-white font-bold rounded-xl hover:bg-slate-800">Done</button>
              </div>
          </div>
       )}
 
-      {/* MAIN CONTENT */}
       {step === 'upload' ? (
-        <div className="flex-1 flex flex-col items-center justify-center p-8 relative z-10">
-             <div className="text-center mb-12">
-                 <h1 className="text-6xl font-black text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-purple-600 mb-4 tracking-tight pb-2">Video Player.</h1>
-                 <p className="text-xl text-slate-500 max-w-lg mx-auto leading-relaxed">Upload and play your high-quality videos.</p>
-             </div>
-             
+        <div className="flex-1 flex flex-col items-center justify-center p-6 relative z-10">
+             <h1 className="text-5xl md:text-6xl font-black text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-purple-600 mb-4 tracking-tighter text-center">Enhance.</h1>
+             <p className="text-slate-500 mb-10 text-center max-w-xs md:max-w-md">Professional video upscaling and restoration powered by WebGL.</p>
              <div 
-                className="w-full max-w-2xl aspect-video bg-white/60 backdrop-blur-xl border-2 border-dashed border-indigo-200 rounded-[2rem] flex flex-col items-center justify-center cursor-pointer hover:border-indigo-500 hover:bg-white/80 transition-all duration-300 group shadow-2xl shadow-indigo-100/50"
+                className="w-full max-w-lg aspect-video bg-white/60 backdrop-blur-xl border-2 border-dashed border-indigo-200 rounded-[2rem] flex flex-col items-center justify-center cursor-pointer hover:border-indigo-500 transition-all shadow-xl active:scale-95"
                 onClick={() => fileInputRef.current?.click()}
              >
-                <div className="w-20 h-20 bg-white rounded-full flex items-center justify-center mb-6 shadow-xl shadow-indigo-100 group-hover:scale-110 transition-transform duration-300">
-                    <Upload size={32} className="text-indigo-600" />
-                </div>
-                <h3 className="text-2xl font-bold text-slate-800 mb-2">Drop your video here</h3>
-                <p className="text-slate-500 font-medium">MP4, WebM, MOV &middot; Up to 2GB</p>
+                <div className="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-full flex items-center justify-center mb-4"><Upload size={28} /></div>
+                <h3 className="text-lg font-bold text-slate-800">Upload Video</h3>
+                <p className="text-slate-400 text-sm mt-1">Tap to browse</p>
                 <input ref={fileInputRef} type="file" accept="video/mp4,video/webm,video/quicktime" className="hidden" onChange={handleFileChange} />
              </div>
         </div>
       ) : (
         <>
-            {/* HEADER */}
-            <div className="flex-none px-8 py-6 flex items-center justify-between z-30 pointer-events-none">
-                <div className="pointer-events-auto bg-white/80 backdrop-blur-md px-4 py-2 rounded-full border border-white/20 shadow-sm flex items-center gap-3">
-                     <button 
-                        onClick={() => { 
-                             setVideoSrc(null); setStep('upload'); setOriginalFileName('video');
-                        }} 
-                        className="text-slate-400 hover:text-slate-900 transition-colors p-1"
-                        title="Back"
-                     > 
-                        <Undo2 size={20}/> 
-                     </button>
-                     
-                     <div className="h-4 w-px bg-slate-200"></div>
-                     <span className="text-sm font-bold text-slate-700 truncate max-w-[200px]">{originalFileName}</span>
+            {/* RESPONSIVE HEADER */}
+            <div className="flex-none px-4 py-4 md:px-8 md:py-6 flex items-center justify-between z-30 pointer-events-none">
+                <div className="pointer-events-auto bg-white/80 backdrop-blur-md px-3 py-1.5 md:px-4 md:py-2 rounded-full border border-white/20 shadow-sm flex items-center gap-3 max-w-[60%]">
+                     <button onClick={() => { setVideoSrc(null); setStep('upload'); }} className="text-slate-400 hover:text-slate-900 p-1"><Undo2 size={18}/></button>
+                     <div className="h-3 w-px bg-slate-200"></div>
+                     <div className="flex flex-col min-w-0">
+                         <span className="text-xs md:text-sm font-bold text-slate-700 truncate leading-tight">{originalFileName}</span>
+                         <span className="text-[10px] text-slate-400 font-medium leading-tight">{fileSizeStr}</span>
+                     </div>
                 </div>
                 
                 <div className="pointer-events-auto relative">
-                     <button 
-                        onClick={() => setShowExportMenu(!showExportMenu)}
-                        className="flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-full text-xs font-bold hover:bg-slate-800 transition-all shadow-lg shadow-slate-900/20 active:scale-95"
-                     > 
-                        <Download size={14} /> Download <ChevronDown size={14} className={showExportMenu ? 'rotate-180 transition-transform' : 'transition-transform'}/>
+                     <button onClick={() => setShowExportMenu(!showExportMenu)} className="flex items-center gap-2 bg-slate-900 text-white px-3 py-1.5 md:px-4 md:py-2 rounded-full text-xs font-bold hover:bg-slate-800 shadow-lg active:scale-95 transition-transform"> 
+                        <Download size={14} /> <span className="hidden md:inline">Download</span> <ChevronDown size={14}/>
                      </button>
-                     
                      {showExportMenu && (
-                        <div className="absolute top-full right-0 mt-2 w-48 bg-white rounded-2xl shadow-xl border border-slate-100 overflow-hidden animate-in fade-in slide-in-from-top-2 p-1 z-50">
-                            <div className="text-[10px] font-bold text-slate-400 px-3 py-2 uppercase tracking-wider">Export Resolution</div>
-                            <button onClick={() => startExportProcess('original')} className="w-full text-left px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex items-center justify-between">
-                                <span>Original</span> <MonitorPlay size={12} className="text-slate-400"/>
-                            </button>
-                            <button onClick={() => startExportProcess('4k')} className="w-full text-left px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex items-center justify-between">
-                                <span>4K Ultra HD</span> <span className="text-[10px] bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded">UHD</span>
-                            </button>
-                            <button onClick={() => startExportProcess('2k')} className="w-full text-left px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex items-center justify-between">
-                                <span>2K Cinema</span> <span className="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded">2K</span>
-                            </button>
-                            <button onClick={() => startExportProcess('1080p')} className="w-full text-left px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex items-center justify-between">
-                                <span>1080p Full HD</span> <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">FHD</span>
-                            </button>
+                        <div className="absolute top-full right-0 mt-2 w-48 bg-white rounded-2xl shadow-xl border border-slate-100 p-1 z-50 animate-in fade-in slide-in-from-top-2">
+                            <button onClick={() => initiateExport('original')} className="w-full text-left px-3 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex justify-between items-center">Original <Share2 size={14} className="text-slate-300"/></button>
+                            <div className="h-px bg-slate-50 my-1"></div>
+                            <button onClick={() => initiateExport('4k')} className="w-full text-left px-3 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex justify-between items-center">4K Ultra <span className="text-[10px] bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded">UHD</span></button>
+                            <button onClick={() => initiateExport('1080p')} className="w-full text-left px-3 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex justify-between items-center">1080p <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">HD</span></button>
                         </div>
                      )}
                 </div>
             </div>
 
-            {/* STAGE */}
+            {/* MAIN STAGE */}
             <div 
-                className="flex-1 relative flex flex-col items-center justify-center overflow-hidden pb-32 z-10"
-                onMouseDown={handleMouseDown}
-                onMouseMove={handleMouseMove}
-                onMouseUp={handleMouseUp}
-                onMouseLeave={handleMouseLeave}
+                className="flex-1 relative flex flex-col items-center justify-center overflow-hidden pb-28 md:pb-40 z-10 w-full touch-none"
+                onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
+                onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd}
             >
-                 <div className="relative w-full max-w-6xl aspect-video shadow-2xl shadow-indigo-900/20 rounded-2xl overflow-hidden bg-slate-900 group">
-                    <video
-                        ref={videoRef}
-                        src={videoSrc || ''}
-                        style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 0, height: 0 }}
-                        onLoadedMetadata={handleMetadataLoaded}
-                        onLoadedData={handleVideoLoaded}
-                        onTimeUpdate={handleTimeUpdate}
-                        onEnded={() => setMode(ProcessingMode.PAUSED)}
-                        playsInline loop muted={isMuted} crossOrigin="anonymous"
-                    />
+                 <div className="relative w-full max-w-6xl aspect-video md:shadow-2xl md:shadow-indigo-900/20 md:rounded-2xl overflow-hidden bg-slate-900">
+                    <video ref={videoRef} src={videoSrc || ''} className="absolute opacity-0 pointer-events-none" onLoadedMetadata={handleMetadataLoaded} onLoadedData={handleVideoLoaded} onTimeUpdate={handleTimeUpdate} onEnded={() => setMode(ProcessingMode.PAUSED)} playsInline loop muted={isMuted} crossOrigin="anonymous" />
                     
-                    <canvas ref={canvasRef} className={`w-full h-full object-contain ${zoom > 1 ? 'cursor-grab active:cursor-grabbing' : ''}`} />
-                    
-                    {/* Fixed Export Canvas: Opacity 0 but technically visible for filters */}
+                    <canvas ref={canvasRef} className={`w-full h-full object-contain ${isSplitView ? 'cursor-ew-resize' : zoom > 1 ? 'cursor-grab active:cursor-grabbing' : ''}`} />
                     <canvas ref={exportCanvasRef} className="fixed top-0 left-0 pointer-events-none opacity-0 -z-50" />
 
-                    {/* STATUS BADGES & ZOOM CONTROLS */}
-                    <div className="absolute top-6 right-6 flex flex-col gap-3 z-20">
-                         {/* Enhanced Badge */}
-                         {isEnhanced && !isComparing && (
-                            <div className="bg-indigo-600 text-white px-4 py-2 rounded-full text-xs font-bold shadow-lg animate-in fade-in slide-in-from-right-4 flex items-center gap-2 self-end">
-                                <Sparkles size={14} className="text-yellow-300" /> ENHANCED
-                            </div>
+                    {/* OVERLAYS */}
+                    <div className="absolute top-4 right-4 md:top-6 md:right-6 flex flex-col gap-3 z-20 pointer-events-none">
+                         {isEnhanced && !isComparing && !isSplitView && (
+                            <div className="bg-indigo-600/90 backdrop-blur text-white px-3 py-1.5 md:px-4 md:py-2 rounded-full text-[10px] md:text-xs font-bold shadow-lg flex items-center gap-2 self-end animate-in fade-in slide-in-from-right"><Sparkles size={12} className="text-yellow-300" /> ENHANCED</div>
                         )}
-                        {/* Compare Badge */}
-                         {isComparing && (
-                            <div className="bg-slate-700 text-white px-4 py-2 rounded-full text-xs font-bold shadow-lg animate-in fade-in slide-in-from-right-4 flex items-center gap-2 self-end">
-                                <Eye size={14} className="text-white" /> ORIGINAL VIEW
-                            </div>
+                        {isComparing && (
+                            <div className="bg-slate-700/90 backdrop-blur text-white px-3 py-1.5 md:px-4 md:py-2 rounded-full text-[10px] md:text-xs font-bold shadow-lg flex items-center gap-2 self-end animate-in fade-in slide-in-from-right"><Eye size={12} /> ORIGINAL</div>
                         )}
-
-                        {/* Zoom Controls */}
-                        <div className="bg-black/40 backdrop-blur-md rounded-2xl p-2 flex flex-col gap-2 border border-white/10 mt-4 transition-opacity duration-300 opacity-0 group-hover:opacity-100 self-end">
-                            <button onClick={handleZoomIn} className="w-10 h-10 flex items-center justify-center text-white hover:bg-white/20 rounded-xl transition-colors active:scale-95" title="Zoom In">
-                                <ZoomIn size={20} />
-                            </button>
-                            <button onClick={handleZoomReset} className="w-10 h-10 flex items-center justify-center text-white hover:bg-white/20 rounded-xl transition-colors active:scale-95" title="Reset Zoom">
-                                <RotateCcw size={18} />
-                            </button>
-                            <button onClick={handleZoomOut} className="w-10 h-10 flex items-center justify-center text-white hover:bg-white/20 rounded-xl transition-colors active:scale-95" title="Zoom Out">
-                                <ZoomOut size={20} />
-                            </button>
-                            {zoom > 1 && (
-                                <div className="w-10 h-10 flex items-center justify-center text-indigo-400 animate-pulse">
-                                     <Move size={18} />
-                                </div>
-                            )}
-                        </div>
                     </div>
+
+                    {/* SLIDER HANDLE & LABELS */}
+                    {isSplitView && (
+                        <>
+                            <div 
+                                className="absolute top-0 bottom-0 w-0.5 bg-white shadow-[0_0_15px_rgba(0,0,0,0.5)] cursor-ew-resize z-30 pointer-events-none"
+                                style={{ left: `${sliderPos * 100}%` }}
+                            >
+                                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-9 h-9 bg-white rounded-full shadow-xl flex items-center justify-center">
+                                    <SplitSquareHorizontal size={18} className="text-slate-900" />
+                                </div>
+                            </div>
+                            
+                            {/* Comparison Labels */}
+                            <div className="absolute top-1/2 left-4 md:left-8 -translate-y-1/2 bg-black/60 backdrop-blur text-white px-4 py-2 rounded-full text-sm font-bold pointer-events-none border border-white/10 shadow-xl z-20 select-none">
+                                After
+                            </div>
+                            <div className="absolute top-1/2 right-4 md:right-8 -translate-y-1/2 bg-black/60 backdrop-blur text-white px-4 py-2 rounded-full text-sm font-bold pointer-events-none border border-white/10 shadow-xl z-20 select-none">
+                                Before
+                            </div>
+                        </>
+                    )}
+
                  </div>
             </div>
 
-            {/* FLOATING CONTROL DECK */}
-            <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-40 w-full max-w-3xl px-4">
-                <div className="bg-white/80 backdrop-blur-xl border border-white/40 rounded-[2rem] p-4 shadow-2xl shadow-indigo-500/15 flex flex-col gap-4">
+            {/* RESPONSIVE CONTROL DECK */}
+            <div className="fixed bottom-4 left-3 right-3 md:bottom-10 md:left-1/2 md:right-auto md:-translate-x-1/2 md:w-full md:max-w-3xl z-40">
+                <div className="bg-white/95 backdrop-blur-xl border border-white/40 rounded-3xl p-3 md:p-5 shadow-2xl shadow-indigo-900/10 flex flex-col gap-2 md:gap-4">
                     
-                    {/* TOP ROW: TIMELINE */}
-                    <div className="flex items-center gap-4 px-2">
-                        <span className="text-xs font-mono font-bold text-slate-400 w-12 text-right">{formatTime(currentTime)}</span>
-                         <input
-                            type="range"
-                            min={0}
-                            max={duration || 100}
-                            value={currentTime}
-                            onChange={handleSeek}
-                            className="flex-1 h-2 bg-slate-200 rounded-full appearance-none cursor-pointer accent-indigo-600"
-                            style={{
-                                backgroundSize: `${(currentTime / (duration || 1)) * 100}% 100%`,
-                                background: `linear-gradient(to right, #4f46e5 ${(currentTime / (duration || 1)) * 100}%, #e2e8f0 ${(currentTime / (duration || 1)) * 100}%)`
-                            }}
-                        />
-                        <span className="text-xs font-mono font-bold text-slate-400 w-12">{formatTime(duration)}</span>
+                    {/* Progress Bar */}
+                    <div className="flex items-center gap-3 px-1">
+                        <span className="text-[10px] md:text-xs font-mono font-bold text-slate-400 w-10 text-right">{formatTime(currentTime)}</span>
+                         <input type="range" min={0} max={duration || 100} value={currentTime} onChange={handleSeek} className="flex-1 h-1.5 md:h-2 bg-slate-200 rounded-full appearance-none cursor-pointer accent-indigo-600 touch-none" />
+                        <span className="text-[10px] md:text-xs font-mono font-bold text-slate-400 w-10">{formatTime(duration)}</span>
                     </div>
 
-                    {/* BOTTOM ROW: ACTIONS */}
-                    <div className="flex items-center justify-between px-2">
-                         <div className="flex items-center gap-2 w-1/3">
-                            <button onClick={toggleMute} className="w-10 h-10 flex items-center justify-center rounded-full hover:bg-slate-100 text-slate-500 transition-colors">
-                                {isMuted ? <VolumeX size={20}/> : <Volume2 size={20}/>}
-                            </button>
+                    {/* Buttons Grid */}
+                    <div className="grid grid-cols-5 gap-2 items-center">
+                         {/* Left: Utility */}
+                         <div className="col-span-1 flex justify-start">
+                            <button onClick={toggleMute} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl bg-slate-50 text-slate-500 hover:bg-slate-100 transition-colors active:scale-95">{isMuted ? <VolumeX size={18}/> : <Volume2 size={18}/>}</button>
                          </div>
+                         
+                         {/* Center: Play */}
+                         <div className="col-span-3 flex justify-center gap-4">
+                            <button onClick={handleZoomReset} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50 hidden md:flex"><RotateCcw size={18}/></button>
 
-                         <div className="flex items-center justify-center w-1/3">
-                            <button onClick={togglePlay} className="w-14 h-14 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full flex items-center justify-center shadow-lg shadow-indigo-600/30 transition-all active:scale-95">
+                            <button onClick={togglePlay} className="w-16 h-12 md:w-20 md:h-14 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-600/20 active:scale-95 transition-all">
                                 {mode === ProcessingMode.PLAYING ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" className="ml-1"/>}
                             </button>
+
+                            <button onClick={handleZoomIn} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50 hidden md:flex"><ZoomIn size={20}/></button>
                          </div>
 
-                         <div className="flex items-center justify-end gap-3 w-1/3">
-                            {/* Compare Button - Visible only when Enhanced */}
-                            {isEnhanced && (
-                                <button
-                                    onMouseDown={() => setIsComparing(true)}
-                                    onMouseUp={() => setIsComparing(false)}
-                                    onMouseLeave={() => setIsComparing(false)}
-                                    className="w-10 h-10 flex items-center justify-center rounded-full bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 transition-colors active:scale-95 border border-slate-200"
-                                    title="Hold to Compare Original"
-                                >
-                                    <SplitSquareHorizontal size={18} />
+                         {/* Right: Enhance Tools */}
+                         <div className="col-span-1 flex justify-end">
+                            {isEnhanced ? (
+                                <div className="flex gap-2">
+                                     <button 
+                                        onClick={toggleSplitView} 
+                                        className={`w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl border transition-colors ${isSplitView ? 'bg-indigo-100 text-indigo-600 border-indigo-200' : 'bg-white text-slate-500 border-slate-200'}`} 
+                                        title="Compare"
+                                     >
+                                         <SplitSquareHorizontal size={18}/>
+                                     </button>
+                                     <button onClick={toggleEnhance} className="hidden md:flex items-center gap-2 px-4 h-12 rounded-2xl font-bold text-sm bg-gradient-to-r from-pink-500 to-indigo-500 text-white shadow-lg active:scale-95"><Sparkles size={16} /> ON</button>
+                                     <button onClick={toggleEnhance} className="md:hidden w-10 h-10 flex items-center justify-center rounded-2xl bg-indigo-600 text-white shadow-lg"><Sparkles size={18} /></button>
+                                </div>
+                            ) : (
+                                <button onClick={toggleEnhance} className="flex items-center justify-center gap-2 w-10 md:w-auto md:px-5 h-10 md:h-12 rounded-2xl font-bold text-sm bg-slate-100 text-slate-600 hover:bg-slate-200 active:scale-95 transition-all">
+                                    <Wand2 size={18} className="text-indigo-600" /> <span className="hidden md:inline">Enhance</span>
                                 </button>
                             )}
-                         
-                            <button 
-                                onClick={toggleEnhance}
-                                className={`flex items-center gap-2 px-5 py-2.5 rounded-full font-bold text-sm transition-all shadow-lg active:scale-95 ${isEnhanced ? 'bg-gradient-to-r from-pink-500 to-indigo-500 text-white shadow-indigo-500/30' : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'}`}
-                            >
-                                <Wand2 size={16} /> Enhance
-                            </button>
                          </div>
                     </div>
                 </div>
