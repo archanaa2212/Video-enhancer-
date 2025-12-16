@@ -1,23 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { ProcessingMode } from './types';
-import { Upload, Play, Pause, Download, Loader2, Undo2, Volume2, VolumeX, AlertCircle, X, CheckCircle2, ZoomIn, ZoomOut, RotateCcw, Wand2, Sparkles, ChevronDown, SplitSquareHorizontal, Eye, Share2, Settings2 } from 'lucide-react';
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
-
-// --- TYPES FOR WEBCODECS (Ambient declarations if not available) ---
-declare class VideoEncoder {
-  constructor(init: any);
-  configure(config: any): void;
-  encode(frame: VideoFrame, options?: any): void;
-  flush(): Promise<void>;
-  close(): void;
-  static isConfigSupported(config: any): Promise<any>;
-}
-
-declare class VideoFrame {
-  constructor(image: CanvasImageSource, init?: any);
-  close(): void;
-  timestamp: number;
-}
+import { Upload, Play, Pause, Download, Loader2, Undo2, Volume2, VolumeX, AlertCircle, X, CheckCircle2, ZoomIn, ZoomOut, RotateCcw, Wand2, Sparkles, ChevronDown, SplitSquareHorizontal, Eye, Share2, FileVideo } from 'lucide-react';
 
 // --- GLSL SHADERS ---
 const VERTEX_SHADER_SOURCE = `
@@ -50,7 +33,7 @@ varying vec2 v_rawCoord;
 // --- Skin Detection (YCbCr) ---
 bool isSkin(vec3 rgb) {
     float r = rgb.r;
-    float g = rgb.g;
+    float g = rgb.r;
     float b = rgb.b;
     float Y  =  0.299*r + 0.587*g + 0.114*b;
     float Cb = -0.169*r - 0.331*g + 0.500*b + 0.5;
@@ -100,6 +83,8 @@ void main() {
     vec3 original = color;
 
     if (u_is_split && v_rawCoord.x > u_slider_pos) {
+        // We draw the line in CSS overlay now for better UI, 
+        // but keep a tiny gap or just render original here.
         gl_FragColor = vec4(original, 1.0);
         return;
     }
@@ -128,7 +113,7 @@ void main() {
 `;
 
 type AppStep = 'upload' | 'original' | 'enhanced';
-type ResolutionOption = 'original' | '1080p' | '2k' | '4k';
+type ResolutionOption = 'original' | '1080p'; // Removed '2k' and '4k'
 
 interface GLContext {
     gl: WebGLRenderingContext;
@@ -143,11 +128,11 @@ const App: React.FC = () => {
   
   // Canvas Refs
   const canvasRef = useRef<HTMLCanvasElement>(null); 
-  const exportCanvasRef = useRef<HTMLCanvasElement>(null);
+  const exportCanvasRef = useRef<HTMLCanvasElement>(null); // Reintroduced
   
   // WebGL Context Refs
   const mainGLRef = useRef<GLContext | null>(null);
-  const exportGLRef = useRef<GLContext | null>(null);
+  const exportGLRef = useRef<GLContext | null>(null); // Reintroduced
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   
@@ -156,8 +141,9 @@ const App: React.FC = () => {
   const isComparingRef = useRef<boolean>(false); 
   const isSplitViewRef = useRef<boolean>(false); 
   const sliderPosRef = useRef<number>(0.5); 
-  const isExportingRef = useRef<boolean>(false);
-  
+  const isExportingRef = useRef<boolean>(false); // Still used for loading overlay
+  const animationFrameLoopIdRef = useRef<number | null>(null); // For export loop
+
   // Zoom & Pan Refs
   const zoomRef = useRef<number>(1);
   const panRef = useRef<{x: number, y: number}>({ x: 0, y: 0 });
@@ -179,6 +165,7 @@ const App: React.FC = () => {
   const [isSplitView, setIsSplitView] = useState(false); 
   
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
+  const [originalFile, setOriginalFile] = useState<File | null>(null); // Store the original file
   const [originalFileName, setOriginalFileName] = useState<string>('video');
   const [fileSizeStr, setFileSizeStr] = useState<string>('');
   
@@ -186,7 +173,7 @@ const App: React.FC = () => {
   const [isMuted, setIsMuted] = useState(false);
   const [zoom, setZoom] = useState<number>(1);
   const [pan, setPan] = useState<{x: number, y: number}>({ x: 0, y: 0 });
-  const [sliderPos, setSliderPosState] = useState(0.5); 
+  const [sliderPos, setSliderPosState] = useState(0.5); // For React rendering of handle
   
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
@@ -196,7 +183,7 @@ const App: React.FC = () => {
   // Save Dialog State
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [exportName, setExportName] = useState('');
-  const [selectedResolution, setSelectedResolution] = useState<ResolutionOption>('original');
+  const [selectedResolution, setSelectedResolution] = useState<ResolutionOption>('original'); // Resolution for export
   
   const [exportSummary, setExportSummary] = useState<{
       show: boolean;
@@ -213,6 +200,9 @@ const App: React.FC = () => {
       progress: number;
       subtext?: string;
   }>({ active: false, message: '', progress: 0 });
+
+  // No longer using FFmpeg.wasm, so no SharedArrayBuffer check needed for it
+  // const [isEnvironmentCompatibleForFFmpeg, setIsEnvironmentCompatibleForFFmpeg] = useState(true);
 
   // Sync state to refs
   useEffect(() => { isEnhancedRef.current = isEnhanced; }, [isEnhanced]);
@@ -302,7 +292,9 @@ const App: React.FC = () => {
       gl.uniform1f(gl.getUniformLocation(program, 'u_zoom'), z);
       gl.uniform2f(gl.getUniformLocation(program, 'u_pan'), p.x, p.y);
 
-      const enhanceActive = (isExport || isEnhancedRef.current) && !isComparingRef.current;
+      // isExport determines if we are rendering for the final export (no comparison)
+      // Otherwise, enhancement state is controlled by isEnhancedRef
+      const enhanceActive = (isExport && isEnhancedRef.current) || (isEnhancedRef.current && !isComparingRef.current);
       gl.uniform1i(gl.getUniformLocation(program, 'u_is_enhanced'), enhanceActive ? 1 : 0);
 
       const splitActive = !isExport && isSplitViewRef.current && isEnhancedRef.current;
@@ -335,6 +327,7 @@ const App: React.FC = () => {
       setOriginalFileName(name);
       setExportName(name + '_enhanced'); // Default export name
       setFileSizeStr(formatFileSize(file.size));
+      setOriginalFile(file); // Store the original file object
       
       setLoading({ active: true, message: 'Loading Video', progress: 30, subtext: 'Preparing workspace...' });
       const url = URL.createObjectURL(file);
@@ -344,7 +337,7 @@ const App: React.FC = () => {
       setZoom(1); setPan({x: 0, y: 0}); 
       setIsMuted(false); setIsEnhanced(false); setIsSplitView(false);
       setCurrentTime(0); setDuration(0);
-      mainGLRef.current = null; exportGLRef.current = null;
+      mainGLRef.current = null; exportGLRef.current = null; // Reintroduced
       setTimeout(() => setLoading(prev => ({...prev, active: false})), 1000);
     }
     event.target.value = '';
@@ -386,7 +379,7 @@ const App: React.FC = () => {
   const setSliderPos = (pos: number) => {
       const p = Math.max(0, Math.min(1, pos));
       sliderPosRef.current = p;
-      setSliderPosState(p); 
+      setSliderPosState(p); // Update state for UI handle
   };
 
   const getVideoNormalizedPos = (e: React.MouseEvent | React.TouchEvent) => {
@@ -401,11 +394,12 @@ const App: React.FC = () => {
     if (!canvasRef.current) return;
     if (isSplitViewRef.current) {
         const pos = getVideoNormalizedPos(e);
+        // Larger hit area for slider logic
         if (Math.abs(pos - sliderPosRef.current) < 0.15) {
              isDraggingSliderRef.current = true; 
              setSliderPos(pos);
         } else if (zoomRef.current > 1) {
-             isDraggingRef.current = true; 
+             isDraggingRef.current = true; // Pan
         }
     } else if (zoomRef.current > 1) {
         isDraggingRef.current = true;
@@ -461,7 +455,7 @@ const App: React.FC = () => {
   const handleTouchEnd = () => { isDraggingRef.current = false; isDraggingSliderRef.current = false; };
   const handleMouseUp = () => { isDraggingRef.current = false; isDraggingSliderRef.current = false; };
 
-  // --- EXPORT LOGIC (WebCodecs) ---
+  // --- EXPORT LOGIC ---
   const initiateExport = (res: ResolutionOption) => {
       setSelectedResolution(res);
       setShowExportMenu(false);
@@ -470,159 +464,141 @@ const App: React.FC = () => {
 
   const executeExport = async () => {
     if (!videoRef.current || !exportCanvasRef.current) return;
-    if (!('VideoEncoder' in window)) {
-        setErrorMsg("Your browser does not support WebCodecs (Export). Please use Chrome/Edge/Safari 16+.");
-        return;
-    }
-
     const video = videoRef.current;
     setShowSaveDialog(false);
     setMode(ProcessingMode.EXPORTING);
     isExportingRef.current = true;
-    setLoading({ active: true, message: 'Initializing Engine', progress: 5, subtext: 'Preparing WebCodecs...' });
+    setLoading({ active: true, message: 'Starting video capture...', progress: 10, subtext: 'Rendering frames in real-time.' });
+    setErrorMsg(null); // Clear any previous error messages
 
-    try {
-        let tW = 1920, tH = 1080;
-        let bitrate = 10_000_000; // 10 Mbps default
+    // Determine target resolution for export
+    let tW = 1920, tH = 1080; // Default to 1080p
+    const res = selectedResolution;
 
-        const res = selectedResolution;
-        if (res === '4k') { 
-            tW = 3840; tH = 2160; 
-            bitrate = 25_000_000; // 25 Mbps
-        } else if (res === '2k') { 
-            tW = 2048; tH = 1080; 
-            bitrate = 15_000_000;
-        } else if (res === 'original') { 
-            tW = video.videoWidth; tH = video.videoHeight;
-            // Adaptive bitrate
-            bitrate = (tW * tH * 30 * 0.15); 
-            if (bitrate < 2_000_000) bitrate = 2_000_000;
+    if (res === '1080p') { 
+        tW = 1920; tH = 1080; 
+    } else if (res === 'original') { 
+        // Use original dimensions, but ensure minimum 1080p
+        tW = video.videoWidth; 
+        tH = video.videoHeight;
+        
+        if (tH < 1080) { // If original height is less than 1080p, upscale to 1080p
+            const aspectRatio = tW / tH;
+            tH = 1080;
+            tW = Math.round(tH * aspectRatio);
         }
-        
-        // Ensure even dimensions
-        if (tW % 2 !== 0) tW--; 
-        if (tH % 2 !== 0) tH--;
-        
-        exportCanvasRef.current.width = tW;
-        exportCanvasRef.current.height = tH;
+    }
+    
+    // Ensure even dimensions for compatibility
+    if (tW % 2 !== 0) tW--; 
+    if (tH % 2 !== 0) tH--; 
 
-        if (!exportGLRef.current) exportGLRef.current = initWebGL(exportCanvasRef.current);
+    exportCanvasRef.current.width = tW;
+    exportCanvasRef.current.height = tH;
 
-        // Muxer Setup
-        const muxer = new Muxer({
-            target: new ArrayBufferTarget(),
-            video: {
-                codec: 'avc', // H.264
-                width: tW,
-                height: tH
-            },
-            firstTimestampBehavior: 'offset'
-        });
+    if (!exportGLRef.current) exportGLRef.current = initWebGL(exportCanvasRef.current);
+    if (!exportGLRef.current) {
+        setErrorMsg("Failed to initialize WebGL for export canvas.");
+        setLoading({active:false, message:'', progress:0});
+        setMode(ProcessingMode.PAUSED);
+        isExportingRef.current = false;
+        return;
+    }
 
-        const videoEncoder = new VideoEncoder({
-            output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-            error: (e) => { throw e; }
-        });
+    video.currentTime = 0;
+    await new Promise(r => setTimeout(r, 200)); // Give video a moment to seek
 
-        // Config
-        const config = {
-            codec: 'avc1.4d002a', // Main Profile, Level 4.2 (widely supported)
-            width: tW,
-            height: tH,
-            bitrate: bitrate,
-            framerate: 30
-        };
-        
-        // Try higher profile for 4K
-        if (tW > 1920) {
-            try {
-                const support = await VideoEncoder.isConfigSupported({ ...config, codec: 'avc1.640033' }); // High Profile Level 5.1
-                if (support.supported) config.codec = 'avc1.640033';
-            } catch(e) {}
+    // Get video stream from canvas and audio stream from video element
+    const canvasStream = exportCanvasRef.current.captureStream(30); // 30 FPS capture
+    const audioTrack = video.captureStream().getAudioTracks()[0]; // Get audio track from original video
+    
+    const combinedStream = new MediaStream();
+    if (canvasStream.getVideoTracks().length > 0) {
+        combinedStream.addTrack(canvasStream.getVideoTracks()[0]);
+    }
+    if (audioTrack) {
+        combinedStream.addTrack(audioTrack);
+    } else {
+        console.warn("No audio track found for export.");
+    }
+
+    // Attempt to use MP4 if supported, fallback to WebM
+    let mimeType = 'video/webm;codecs=vp9';
+    if (MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')) {
+        mimeType = 'video/mp4;codecs=avc1';
+    } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+        mimeType = 'video/webm;codecs=vp8';
+    } else {
+        setErrorMsg("Your browser does not support WebM or MP4 video recording. Export may not work.");
+    }
+
+    const recorder = new MediaRecorder(combinedStream, { 
+        mimeType: mimeType, 
+        videoBitsPerSecond: 10000000 // 10 Mbps for reasonable quality
+    });
+    
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    
+    const stopPromise = new Promise<void>(resolve => { recorder.onstop = () => resolve(); });
+    recorder.start();
+    
+    try { await video.play(); } catch(e) {} // Play video to ensure frames are drawn
+
+    const exportLoop = () => {
+        if (!isExportingRef.current) {
+            if (animationFrameLoopIdRef.current) cancelAnimationFrame(animationFrameLoopIdRef.current);
+            recorder.stop(); // Ensure recorder is stopped on cancel
+            return;
         }
-
-        videoEncoder.configure(config);
-
-        video.currentTime = 0;
-        await new Promise(r => setTimeout(r, 200)); // Buffer safety
-
-        const fps = 30;
-        const totalDuration = video.duration;
-        const totalFrames = Math.floor(totalDuration * fps);
-        const timePerFrame = 1 / fps;
-
-        setLoading({ active: true, message: 'Rendering...', progress: 0, subtext: `0 / ${totalFrames} frames` });
-
-        for (let i = 0; i < totalFrames; i++) {
-            if (!isExportingRef.current) break;
-
-            const time = i * timePerFrame;
-            video.currentTime = time;
-            
-            // Wait for seek
-            await new Promise<void>(resolve => {
-                const onSeek = () => {
-                    video.removeEventListener('seeked', onSeek);
-                    resolve();
-                };
-                video.addEventListener('seeked', onSeek);
-                // Fallback timeout in case seeked doesn't fire fast enough
-                if(video.readyState >= 2) onSeek();
-            });
-
-            // Draw Enhanced Frame
-            if (exportGLRef.current) {
-                renderGLFrame(exportGLRef.current, video, tW, tH, true);
-            }
-
-            // Encode
-            const frame = new VideoFrame(exportCanvasRef.current, { timestamp: time * 1_000_000 });
-            videoEncoder.encode(frame, { keyFrame: i % 60 === 0 });
-            frame.close();
-
-            // Progress
-            if (i % 10 === 0) {
-                setLoading(prev => ({ 
-                    ...prev, 
-                    progress: (i / totalFrames) * 100,
-                    subtext: `${i} / ${totalFrames} frames`
-                }));
-                // Yield to main thread to keep UI responsive
-                await new Promise(r => setTimeout(r, 0));
-            }
+        if (video.ended) { 
+            recorder.stop(); 
+            if (animationFrameLoopIdRef.current) cancelAnimationFrame(animationFrameLoopIdRef.current);
+            return; 
         }
+        // Render current video frame with enhancements to the off-screen export canvas
+        if (exportGLRef.current) renderGLFrame(exportGLRef.current, video, tW, tH, true);
+        const p = (video.currentTime / video.duration) * 100;
+        setLoading(prev => ({ ...prev, progress: Math.min(100, p), subtext: `Recording video frames: ${Math.round(p)}% complete` })); // Progress directly to 100%
+        animationFrameLoopIdRef.current = requestAnimationFrame(exportLoop);
+    };
+    animationFrameLoopIdRef.current = requestAnimationFrame(exportLoop); // Start the export rendering loop
 
-        await videoEncoder.flush();
-        muxer.finalize();
-        
-        const { buffer } = muxer.target;
-        const blob = new Blob([buffer], { type: 'video/mp4' });
-        const url = URL.createObjectURL(blob);
-        
-        const a = document.createElement('a');
-        a.href = url;
-        let dlName = exportName.trim() || 'enhanced_video';
-        if(!dlName.toLowerCase().endsWith('.mp4')) dlName += '.mp4';
-        a.download = dlName;
-        a.click();
+    await stopPromise; // Wait for recording to finish
+    video.pause();
 
-        setExportSummary({ 
-            show: true, 
-            filename: dlName, 
-            size: formatFileSize(buffer.byteLength), 
-            duration: formatTime(duration), 
-            resolution: `${tW}x${tH}`, 
-            fps: 30 
-        });
+    if (!isExportingRef.current) { // Export cancelled
+        setLoading({active:false, message:'', progress:0});
+        setMode(ProcessingMode.PAUSED);
+        return;
+    }
 
-    } catch (e: any) {
-        console.error(e);
-        setErrorMsg("Export failed: " + (e.message || "Unknown error"));
-    } finally {
-        setLoading(p => ({...p, active: false})); 
+    // MediaRecorder output is the final output
+    let finalBlob = new Blob(chunks, { type: mimeType });
+    let finalDlName = exportName.trim() || 'enhanced_video';
+    let outputFormat = mimeType.includes('mp4') ? 'mp4' : 'webm';
+
+    if(!finalDlName.toLowerCase().endsWith(`.${outputFormat}`)) finalDlName += `.${outputFormat}`;
+    triggerDownload(finalBlob, finalDlName, outputFormat);
+
+    setLoading({ active: true, message: 'Finalizing video file...', progress: 95, subtext: 'Preparing for download.' });
+    setTimeout(() => {
+        setExportSummary({ show: true, filename: finalDlName, size: formatFileSize(finalBlob.size), duration: formatTime(duration), resolution: `${tW}x${tH}`, fps: 30 });
+        setLoading({active:false, message:'', progress:0}); 
         setMode(ProcessingMode.PAUSED); 
         isExportingRef.current = false;
-    }
+    }, 1000);
+  };
+
+  const triggerDownload = (blob: Blob, filename: string, type: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a); // Required for Firefox
+    a.click();
+    document.body.removeChild(a); // Clean up
+    URL.revokeObjectURL(url);
   };
 
   const formatTime = (seconds: number) => {
@@ -633,6 +609,7 @@ const App: React.FC = () => {
   };
 
   const handleZoomIn = (e: React.MouseEvent) => { e.stopPropagation(); setZoom(z => Math.min(z + 0.5, 4)); };
+  const handleZoomOut = (e: React.MouseEvent) => { e.stopPropagation(); setZoom(z => { const n = Math.max(z - 0.5, 1); if(n===1) setPan({x:0,y:0}); return n; }); };
   const handleZoomReset = (e: React.MouseEvent) => { e.stopPropagation(); setZoom(1); setPan({x:0,y:0}); };
 
   return (
@@ -683,7 +660,11 @@ const App: React.FC = () => {
                   <div className="bg-slate-50 rounded-xl p-3 mb-6">
                       <div className="flex justify-between text-sm mb-1">
                           <span className="text-slate-500">Quality</span>
-                          <span className="font-bold text-indigo-600">High (H.264 GPU)</span>
+                          {isEnhanced ? (
+                              <span className="font-bold text-indigo-600">Enhanced (Browser Native)</span>
+                          ) : (
+                              <span className="font-bold text-slate-600">Original (Browser Native)</span>
+                          )}
                       </div>
                       <div className="flex justify-between text-sm">
                           <span className="text-slate-500">Resolution</span>
@@ -729,10 +710,10 @@ const App: React.FC = () => {
       ) : (
         <>
             {/* RESPONSIVE HEADER */}
-            <div className="flex-none px-2 py-2 md:px-8 md:py-6 flex items-center justify-between z-30 pointer-events-none">
-                <div className="pointer-events-auto bg-white/80 backdrop-blur-md px-3 py-2 rounded-2xl border border-white/20 shadow-sm flex items-center gap-2 md:gap-3 max-w-[60%] lg:max-w-full">
-                     <button onClick={() => { setVideoSrc(null); setStep('upload'); }} className="text-slate-400 hover:text-slate-900 p-1"><Undo2 size={16}/></button>
-                     <div className="h-4 w-px bg-slate-200"></div>
+            <div className="flex-none px-4 py-4 md:px-8 md:py-6 flex items-center justify-between z-30 pointer-events-none">
+                <div className="pointer-events-auto bg-white/80 backdrop-blur-md px-3 py-1.5 md:px-4 md:py-2 rounded-full border border-white/20 shadow-sm flex items-center gap-3 max-w-[60%]">
+                     <button onClick={() => { setVideoSrc(null); setStep('upload'); }} className="text-slate-400 hover:text-slate-900 p-1"><Undo2 size={18}/></button>
+                     <div className="h-3 w-px bg-slate-200"></div>
                      <div className="flex flex-col min-w-0">
                          <span className="text-xs md:text-sm font-bold text-slate-700 truncate leading-tight">{originalFileName}</span>
                          <span className="text-[10px] text-slate-400 font-medium leading-tight">{fileSizeStr}</span>
@@ -740,14 +721,14 @@ const App: React.FC = () => {
                 </div>
                 
                 <div className="pointer-events-auto relative">
-                     <button onClick={() => setShowExportMenu(!showExportMenu)} className="flex items-center gap-2 bg-slate-900 text-white px-3 py-2 rounded-2xl text-xs font-bold hover:bg-slate-800 shadow-lg active:scale-95 transition-transform"> 
+                     <button onClick={() => setShowExportMenu(!showExportMenu)} className={`flex items-center gap-2 bg-slate-900 text-white px-3 py-1.5 md:px-4 md:py-2 rounded-full text-xs font-bold shadow-lg transition-transform hover:bg-slate-800 active:scale-95`}> 
                         <Download size={14} /> <span className="hidden md:inline">Download</span> <ChevronDown size={14}/>
                      </button>
                      {showExportMenu && (
                         <div className="absolute top-full right-0 mt-2 w-48 bg-white rounded-2xl shadow-xl border border-slate-100 p-1 z-50 animate-in fade-in slide-in-from-top-2">
                             <button onClick={() => initiateExport('original')} className="w-full text-left px-3 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex justify-between items-center">Original <Share2 size={14} className="text-slate-300"/></button>
                             <div className="h-px bg-slate-50 my-1"></div>
-                            <button onClick={() => initiateExport('4k')} className="w-full text-left px-3 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex justify-between items-center">4K Ultra <span className="text-[10px] bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded">UHD</span></button>
+                            {/* Removed 2K and 4K options */}
                             <button onClick={() => initiateExport('1080p')} className="w-full text-left px-3 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50 rounded-lg flex justify-between items-center">1080p <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">HD</span></button>
                         </div>
                      )}
@@ -767,7 +748,7 @@ const App: React.FC = () => {
                     <canvas ref={exportCanvasRef} className="fixed top-0 left-0 pointer-events-none opacity-0 -z-50" />
 
                     {/* OVERLAYS */}
-                    <div className="absolute top-4 right-4 md:top-6 md:right-6 flex flex-col gap-2 z-20 pointer-events-none">
+                    <div className="absolute top-4 right-4 md:top-6 md:right-6 flex flex-col gap-3 z-20 pointer-events-none">
                          {isEnhanced && !isComparing && !isSplitView && (
                             <div className="bg-indigo-600/90 backdrop-blur text-white px-3 py-1.5 md:px-4 md:py-2 rounded-full text-[10px] md:text-xs font-bold shadow-lg flex items-center gap-2 self-end animate-in fade-in slide-in-from-right"><Sparkles size={12} className="text-yellow-300" /> ENHANCED</div>
                         )}
@@ -776,25 +757,24 @@ const App: React.FC = () => {
                         )}
                     </div>
 
-                    {/* SLIDER HANDLE & LABELS */}
+                    {/* SLIDER HANDLE */}
                     {isSplitView && (
-                        <>
-                            <div 
-                                className="absolute top-0 bottom-0 w-0.5 bg-white shadow-[0_0_15px_rgba(0,0,0,0.5)] cursor-ew-resize z-30 pointer-events-none"
-                                style={{ left: `${sliderPos * 100}%` }}
-                            >
-                                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 md:w-9 md:h-9 bg-white rounded-full shadow-xl flex items-center justify-center border border-slate-100">
-                                    <SplitSquareHorizontal size={16} className="text-slate-900" />
-                                </div>
+                        <div 
+                            className="absolute top-0 bottom-0 w-0.5 bg-white shadow-[0_0_15px_rgba(0,0,0,0.5)] cursor-ew-resize z-30 pointer-events-none"
+                            style={{ left: `${sliderPos * 100}%` }}
+                        >
+                            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-9 h-9 bg-white rounded-full shadow-xl flex items-center justify-center">
+                                <SplitSquareHorizontal size={18} className="text-slate-900" />
                             </div>
-                        </>
+                        </div>
                     )}
+
                  </div>
             </div>
 
             {/* RESPONSIVE CONTROL DECK */}
-            <div className="fixed bottom-2 left-2 right-2 md:bottom-10 md:left-1/2 md:right-auto md:-translate-x-1/2 md:w-full md:max-w-2xl z-40">
-                <div className="bg-white/95 backdrop-blur-xl border border-white/40 rounded-[2rem] p-3 md:p-5 shadow-2xl shadow-indigo-900/10 flex flex-col gap-2 md:gap-4">
+            <div className="fixed bottom-4 left-3 right-3 md:bottom-10 md:left-1/2 md:right-auto md:-translate-x-1/2 md:w-full md:max-w-3xl z-40">
+                <div className="bg-white/95 backdrop-blur-xl border border-white/40 rounded-3xl p-3 md:p-5 shadow-2xl shadow-indigo-900/10 flex flex-col gap-2 md:gap-4">
                     
                     {/* Progress Bar */}
                     <div className="flex items-center gap-3 px-1">
@@ -805,20 +785,20 @@ const App: React.FC = () => {
 
                     {/* Buttons Grid */}
                     <div className="grid grid-cols-5 gap-2 items-center">
-                         {/* Left: Mute */}
+                         {/* Left: Utility */}
                          <div className="col-span-1 flex justify-start">
                             <button onClick={toggleMute} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl bg-slate-50 text-slate-500 hover:bg-slate-100 transition-colors active:scale-95">{isMuted ? <VolumeX size={18}/> : <Volume2 size={18}/>}</button>
                          </div>
                          
-                         {/* Center: Play & Zoom */}
-                         <div className="col-span-3 flex justify-center gap-3">
-                            <button onClick={handleZoomReset} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50"><RotateCcw size={18}/></button>
+                         {/* Center: Play */}
+                         <div className="col-span-3 flex justify-center gap-4">
+                            <button onClick={handleZoomReset} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50 hidden md:flex"><RotateCcw size={18}/></button>
 
-                            <button onClick={togglePlay} className="w-16 h-10 md:w-20 md:h-12 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-600/20 active:scale-95 transition-all">
+                            <button onClick={togglePlay} className="w-16 h-12 md:w-20 md:h-14 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-600/20 active:scale-95 transition-all">
                                 {mode === ProcessingMode.PLAYING ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" className="ml-1"/>}
                             </button>
 
-                            <button onClick={handleZoomIn} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50"><ZoomIn size={20}/></button>
+                            <button onClick={handleZoomIn} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50 hidden md:flex"><ZoomIn size={20}/></button>
                          </div>
 
                          {/* Right: Enhance Tools */}

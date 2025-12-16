@@ -18,7 +18,7 @@ export enum ProcessingMode {
 export interface ExportConfig {
   filename: string;
   format: 'mp4' | 'webm';
-  resolution: 'original' | '1080p' | '720p' | '480p';
+  resolution: 'original' | '1080p'; // Changed from 'original' | '1080p' | '720p' | '480p' and App.tsx's 'original' | '1080p' | '2k'
   fps: 24 | 30 | 60;
   quality: 'low' | 'medium' | 'high' | 'ultra';
 }
@@ -35,8 +35,8 @@ export interface AnalysisResult {
   hairDetected: boolean;
   faceFeaturesDetected: boolean;
   skinDetected: boolean;
-  lipsDetected: boolean;  // New: For lip color enhancement
-  teethDetected: boolean; // New: For teeth whitening/clarity
+  lipsDetected: boolean;
+  teethDetected: boolean;
   skinTone?: string;
   natureDetected: boolean;
   boostVibrance: boolean;
