@@ -1,8 +1,23 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { ProcessingMode } from './types';
-import { Upload, Play, Pause, Download, Loader2, Undo2, Volume2, VolumeX, AlertCircle, X, CheckCircle2, ZoomIn, ZoomOut, RotateCcw, Wand2, Sparkles, ChevronDown, MonitorPlay, SplitSquareHorizontal, Eye, Share2, FileVideo } from 'lucide-react';
-import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import { Upload, Play, Pause, Download, Loader2, Undo2, Volume2, VolumeX, AlertCircle, X, CheckCircle2, ZoomIn, ZoomOut, RotateCcw, Wand2, Sparkles, ChevronDown, SplitSquareHorizontal, Eye, Share2, Settings2 } from 'lucide-react';
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+
+// --- TYPES FOR WEBCODECS (Ambient declarations if not available) ---
+declare class VideoEncoder {
+  constructor(init: any);
+  configure(config: any): void;
+  encode(frame: VideoFrame, options?: any): void;
+  flush(): Promise<void>;
+  close(): void;
+  static isConfigSupported(config: any): Promise<any>;
+}
+
+declare class VideoFrame {
+  constructor(image: CanvasImageSource, init?: any);
+  close(): void;
+  timestamp: number;
+}
 
 // --- GLSL SHADERS ---
 const VERTEX_SHADER_SOURCE = `
@@ -85,8 +100,6 @@ void main() {
     vec3 original = color;
 
     if (u_is_split && v_rawCoord.x > u_slider_pos) {
-        // We draw the line in CSS overlay now for better UI, 
-        // but keep a tiny gap or just render original here.
         gl_FragColor = vec4(original, 1.0);
         return;
     }
@@ -173,7 +186,7 @@ const App: React.FC = () => {
   const [isMuted, setIsMuted] = useState(false);
   const [zoom, setZoom] = useState<number>(1);
   const [pan, setPan] = useState<{x: number, y: number}>({ x: 0, y: 0 });
-  const [sliderPos, setSliderPosState] = useState(0.5); // For React rendering of handle
+  const [sliderPos, setSliderPosState] = useState(0.5); 
   
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
@@ -184,9 +197,6 @@ const App: React.FC = () => {
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [exportName, setExportName] = useState('');
   const [selectedResolution, setSelectedResolution] = useState<ResolutionOption>('original');
-
-  // FFmpeg State
-  const ffmpegRef = useRef<FFmpeg | null>(null);
   
   const [exportSummary, setExportSummary] = useState<{
       show: boolean;
@@ -376,7 +386,7 @@ const App: React.FC = () => {
   const setSliderPos = (pos: number) => {
       const p = Math.max(0, Math.min(1, pos));
       sliderPosRef.current = p;
-      setSliderPosState(p); // Update state for UI handle
+      setSliderPosState(p); 
   };
 
   const getVideoNormalizedPos = (e: React.MouseEvent | React.TouchEvent) => {
@@ -391,12 +401,11 @@ const App: React.FC = () => {
     if (!canvasRef.current) return;
     if (isSplitViewRef.current) {
         const pos = getVideoNormalizedPos(e);
-        // Larger hit area for slider logic
         if (Math.abs(pos - sliderPosRef.current) < 0.15) {
              isDraggingSliderRef.current = true; 
              setSliderPos(pos);
         } else if (zoomRef.current > 1) {
-             isDraggingRef.current = true; // Pan
+             isDraggingRef.current = true; 
         }
     } else if (zoomRef.current > 1) {
         isDraggingRef.current = true;
@@ -452,32 +461,7 @@ const App: React.FC = () => {
   const handleTouchEnd = () => { isDraggingRef.current = false; isDraggingSliderRef.current = false; };
   const handleMouseUp = () => { isDraggingRef.current = false; isDraggingSliderRef.current = false; };
 
-  // --- EXPORT LOGIC ---
-  const loadFFmpeg = async () => {
-    if (ffmpegRef.current) return ffmpegRef.current;
-    
-    const ffmpeg = new FFmpeg();
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm';
-    const workerURL = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js';
-
-    try {
-        const coreBlob = await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript');
-        const wasmBlob = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
-        const workerBlob = new Blob([`import "${workerURL}";`], { type: 'application/javascript' });
-        const workerBlobURL = URL.createObjectURL(workerBlob);
-
-        await ffmpeg.load({ coreURL: coreBlob, wasmURL: wasmBlob, workerURL: workerBlobURL });
-        ffmpegRef.current = ffmpeg;
-        return ffmpeg;
-    } catch (error: any) {
-        console.error("FFmpeg Load Error:", error);
-        if (error.message && (error.message.includes("SharedArrayBuffer") || error.message.includes("is not defined"))) {
-            throw new Error("Export Unavailable: Browser not supported. Please use Chrome/Edge/Firefox on Desktop.");
-        }
-        throw new Error("Failed to load video engine. Please check your connection.");
-    }
-  };
-
+  // --- EXPORT LOGIC (WebCodecs) ---
   const initiateExport = (res: ResolutionOption) => {
       setSelectedResolution(res);
       setShowExportMenu(false);
@@ -486,101 +470,159 @@ const App: React.FC = () => {
 
   const executeExport = async () => {
     if (!videoRef.current || !exportCanvasRef.current) return;
+    if (!('VideoEncoder' in window)) {
+        setErrorMsg("Your browser does not support WebCodecs (Export). Please use Chrome/Edge/Safari 16+.");
+        return;
+    }
+
     const video = videoRef.current;
     setShowSaveDialog(false);
     setMode(ProcessingMode.EXPORTING);
     isExportingRef.current = true;
-    setLoading({ active: true, message: 'Initializing...', progress: 10, subtext: 'Loading engine...' });
+    setLoading({ active: true, message: 'Initializing Engine', progress: 5, subtext: 'Preparing WebCodecs...' });
 
-    let ffmpeg: FFmpeg;
-    try { 
-        ffmpeg = await loadFFmpeg(); 
-    } catch (e: any) { 
-        setErrorMsg(e.message || "Failed to load FFmpeg."); 
-        isExportingRef.current = false; 
-        setLoading({active:false, message:'', progress:0}); 
-        return; 
-    }
-
-    setLoading({ active: true, message: 'Capturing...', progress: 0, subtext: 'High-quality recording...' });
-
-    let tW = 1920, tH = 1080;
-    const res = selectedResolution;
-    if (res === '4k') { tW = 3840; tH = 2160; }
-    else if (res === '2k') { tW = 2048; tH = 1080; }
-    else if (res === 'original') { tW = video.videoWidth; tH = video.videoHeight; }
-    if (tW % 2 !== 0) tW--; if (tH % 2 !== 0) tH--;
-    
-    exportCanvasRef.current.width = tW;
-    exportCanvasRef.current.height = tH;
-
-    if (!exportGLRef.current) exportGLRef.current = initWebGL(exportCanvasRef.current);
-
-    video.currentTime = 0;
-    await new Promise(r => setTimeout(r, 200));
-
-    // High bitrate capture (80 Mbps) to minimize MediaRecorder artifacts before ffmpeg
-    const stream = exportCanvasRef.current.captureStream(30);
-    const recorder = new MediaRecorder(stream, { 
-        mimeType: 'video/webm;codecs=vp9', 
-        videoBitsPerSecond: 80000000 
-    });
-    
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-    
-    const stopPromise = new Promise<void>(resolve => { recorder.onstop = () => resolve(); });
-    recorder.start();
-    
-    try { await video.play(); } catch(e) {}
-
-    const exportLoop = () => {
-        if (!isExportingRef.current) return;
-        if (video.ended) { recorder.stop(); return; }
-        if (exportGLRef.current) renderGLFrame(exportGLRef.current, video, tW, tH, true);
-        const p = (video.currentTime / video.duration) * 100;
-        setLoading(prev => ({ ...prev, progress: Math.min(90, p) }));
-        requestAnimationFrame(exportLoop);
-    };
-    exportLoop();
-
-    await stopPromise;
-    video.pause();
-
-    if (!isExportingRef.current) return;
-
-    setLoading({ active: true, message: 'Encoding...', progress: 95, subtext: 'Creating high-quality MP4...' });
-    
-    const blob = new Blob(chunks, { type: 'video/webm' });
-    const inName = 'input.webm';
-    const outName = 'output.mp4';
-    
     try {
-        await ffmpeg.writeFile(inName, await fetchFile(blob));
-        // High quality encoding parameters: CRF 17 (Visually Lossless), Preset Medium
-        await ffmpeg.exec([
-            '-i', inName, 
-            '-c:v', 'libx264', 
-            '-preset', 'medium', 
-            '-crf', '17', 
-            '-pix_fmt', 'yuv420p', 
-            outName
-        ]);
-        const data = await ffmpeg.readFile(outName);
-        const url = URL.createObjectURL(new Blob([data], { type: 'video/mp4' }));
+        let tW = 1920, tH = 1080;
+        let bitrate = 10_000_000; // 10 Mbps default
+
+        const res = selectedResolution;
+        if (res === '4k') { 
+            tW = 3840; tH = 2160; 
+            bitrate = 25_000_000; // 25 Mbps
+        } else if (res === '2k') { 
+            tW = 2048; tH = 1080; 
+            bitrate = 15_000_000;
+        } else if (res === 'original') { 
+            tW = video.videoWidth; tH = video.videoHeight;
+            // Adaptive bitrate
+            bitrate = (tW * tH * 30 * 0.15); 
+            if (bitrate < 2_000_000) bitrate = 2_000_000;
+        }
+        
+        // Ensure even dimensions
+        if (tW % 2 !== 0) tW--; 
+        if (tH % 2 !== 0) tH--;
+        
+        exportCanvasRef.current.width = tW;
+        exportCanvasRef.current.height = tH;
+
+        if (!exportGLRef.current) exportGLRef.current = initWebGL(exportCanvasRef.current);
+
+        // Muxer Setup
+        const muxer = new Muxer({
+            target: new ArrayBufferTarget(),
+            video: {
+                codec: 'avc', // H.264
+                width: tW,
+                height: tH
+            },
+            firstTimestampBehavior: 'offset'
+        });
+
+        const videoEncoder = new VideoEncoder({
+            output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+            error: (e) => { throw e; }
+        });
+
+        // Config
+        const config = {
+            codec: 'avc1.4d002a', // Main Profile, Level 4.2 (widely supported)
+            width: tW,
+            height: tH,
+            bitrate: bitrate,
+            framerate: 30
+        };
+        
+        // Try higher profile for 4K
+        if (tW > 1920) {
+            try {
+                const support = await VideoEncoder.isConfigSupported({ ...config, codec: 'avc1.640033' }); // High Profile Level 5.1
+                if (support.supported) config.codec = 'avc1.640033';
+            } catch(e) {}
+        }
+
+        videoEncoder.configure(config);
+
+        video.currentTime = 0;
+        await new Promise(r => setTimeout(r, 200)); // Buffer safety
+
+        const fps = 30;
+        const totalDuration = video.duration;
+        const totalFrames = Math.floor(totalDuration * fps);
+        const timePerFrame = 1 / fps;
+
+        setLoading({ active: true, message: 'Rendering...', progress: 0, subtext: `0 / ${totalFrames} frames` });
+
+        for (let i = 0; i < totalFrames; i++) {
+            if (!isExportingRef.current) break;
+
+            const time = i * timePerFrame;
+            video.currentTime = time;
+            
+            // Wait for seek
+            await new Promise<void>(resolve => {
+                const onSeek = () => {
+                    video.removeEventListener('seeked', onSeek);
+                    resolve();
+                };
+                video.addEventListener('seeked', onSeek);
+                // Fallback timeout in case seeked doesn't fire fast enough
+                if(video.readyState >= 2) onSeek();
+            });
+
+            // Draw Enhanced Frame
+            if (exportGLRef.current) {
+                renderGLFrame(exportGLRef.current, video, tW, tH, true);
+            }
+
+            // Encode
+            const frame = new VideoFrame(exportCanvasRef.current, { timestamp: time * 1_000_000 });
+            videoEncoder.encode(frame, { keyFrame: i % 60 === 0 });
+            frame.close();
+
+            // Progress
+            if (i % 10 === 0) {
+                setLoading(prev => ({ 
+                    ...prev, 
+                    progress: (i / totalFrames) * 100,
+                    subtext: `${i} / ${totalFrames} frames`
+                }));
+                // Yield to main thread to keep UI responsive
+                await new Promise(r => setTimeout(r, 0));
+            }
+        }
+
+        await videoEncoder.flush();
+        muxer.finalize();
+        
+        const { buffer } = muxer.target;
+        const blob = new Blob([buffer], { type: 'video/mp4' });
+        const url = URL.createObjectURL(blob);
+        
         const a = document.createElement('a');
         a.href = url;
-        // Use user defined filename
         let dlName = exportName.trim() || 'enhanced_video';
         if(!dlName.toLowerCase().endsWith('.mp4')) dlName += '.mp4';
-        
         a.download = dlName;
         a.click();
-        
-        setExportSummary({ show: true, filename: dlName, size: formatFileSize(data.byteLength as number), duration: formatTime(duration), resolution: `${tW}x${tH}`, fps: 30 });
-        await ffmpeg.deleteFile(inName); await ffmpeg.deleteFile(outName);
-    } catch (e) { setErrorMsg("Encoding failed."); } 
-    finally { setLoading(p => ({...p, active: false})); setMode(ProcessingMode.PAUSED); isExportingRef.current = false; }
+
+        setExportSummary({ 
+            show: true, 
+            filename: dlName, 
+            size: formatFileSize(buffer.byteLength), 
+            duration: formatTime(duration), 
+            resolution: `${tW}x${tH}`, 
+            fps: 30 
+        });
+
+    } catch (e: any) {
+        console.error(e);
+        setErrorMsg("Export failed: " + (e.message || "Unknown error"));
+    } finally {
+        setLoading(p => ({...p, active: false})); 
+        setMode(ProcessingMode.PAUSED); 
+        isExportingRef.current = false;
+    }
   };
 
   const formatTime = (seconds: number) => {
@@ -591,7 +633,6 @@ const App: React.FC = () => {
   };
 
   const handleZoomIn = (e: React.MouseEvent) => { e.stopPropagation(); setZoom(z => Math.min(z + 0.5, 4)); };
-  const handleZoomOut = (e: React.MouseEvent) => { e.stopPropagation(); setZoom(z => { const n = Math.max(z - 0.5, 1); if(n===1) setPan({x:0,y:0}); return n; }); };
   const handleZoomReset = (e: React.MouseEvent) => { e.stopPropagation(); setZoom(1); setPan({x:0,y:0}); };
 
   return (
@@ -642,7 +683,7 @@ const App: React.FC = () => {
                   <div className="bg-slate-50 rounded-xl p-3 mb-6">
                       <div className="flex justify-between text-sm mb-1">
                           <span className="text-slate-500">Quality</span>
-                          <span className="font-bold text-indigo-600">High (CRF 17)</span>
+                          <span className="font-bold text-indigo-600">High (H.264 GPU)</span>
                       </div>
                       <div className="flex justify-between text-sm">
                           <span className="text-slate-500">Resolution</span>
@@ -688,10 +729,10 @@ const App: React.FC = () => {
       ) : (
         <>
             {/* RESPONSIVE HEADER */}
-            <div className="flex-none px-4 py-4 md:px-8 md:py-6 flex items-center justify-between z-30 pointer-events-none">
-                <div className="pointer-events-auto bg-white/80 backdrop-blur-md px-3 py-1.5 md:px-4 md:py-2 rounded-full border border-white/20 shadow-sm flex items-center gap-3 max-w-[60%]">
-                     <button onClick={() => { setVideoSrc(null); setStep('upload'); }} className="text-slate-400 hover:text-slate-900 p-1"><Undo2 size={18}/></button>
-                     <div className="h-3 w-px bg-slate-200"></div>
+            <div className="flex-none px-2 py-2 md:px-8 md:py-6 flex items-center justify-between z-30 pointer-events-none">
+                <div className="pointer-events-auto bg-white/80 backdrop-blur-md px-3 py-2 rounded-2xl border border-white/20 shadow-sm flex items-center gap-2 md:gap-3 max-w-[60%] lg:max-w-full">
+                     <button onClick={() => { setVideoSrc(null); setStep('upload'); }} className="text-slate-400 hover:text-slate-900 p-1"><Undo2 size={16}/></button>
+                     <div className="h-4 w-px bg-slate-200"></div>
                      <div className="flex flex-col min-w-0">
                          <span className="text-xs md:text-sm font-bold text-slate-700 truncate leading-tight">{originalFileName}</span>
                          <span className="text-[10px] text-slate-400 font-medium leading-tight">{fileSizeStr}</span>
@@ -699,7 +740,7 @@ const App: React.FC = () => {
                 </div>
                 
                 <div className="pointer-events-auto relative">
-                     <button onClick={() => setShowExportMenu(!showExportMenu)} className="flex items-center gap-2 bg-slate-900 text-white px-3 py-1.5 md:px-4 md:py-2 rounded-full text-xs font-bold hover:bg-slate-800 shadow-lg active:scale-95 transition-transform"> 
+                     <button onClick={() => setShowExportMenu(!showExportMenu)} className="flex items-center gap-2 bg-slate-900 text-white px-3 py-2 rounded-2xl text-xs font-bold hover:bg-slate-800 shadow-lg active:scale-95 transition-transform"> 
                         <Download size={14} /> <span className="hidden md:inline">Download</span> <ChevronDown size={14}/>
                      </button>
                      {showExportMenu && (
@@ -726,7 +767,7 @@ const App: React.FC = () => {
                     <canvas ref={exportCanvasRef} className="fixed top-0 left-0 pointer-events-none opacity-0 -z-50" />
 
                     {/* OVERLAYS */}
-                    <div className="absolute top-4 right-4 md:top-6 md:right-6 flex flex-col gap-3 z-20 pointer-events-none">
+                    <div className="absolute top-4 right-4 md:top-6 md:right-6 flex flex-col gap-2 z-20 pointer-events-none">
                          {isEnhanced && !isComparing && !isSplitView && (
                             <div className="bg-indigo-600/90 backdrop-blur text-white px-3 py-1.5 md:px-4 md:py-2 rounded-full text-[10px] md:text-xs font-bold shadow-lg flex items-center gap-2 self-end animate-in fade-in slide-in-from-right"><Sparkles size={12} className="text-yellow-300" /> ENHANCED</div>
                         )}
@@ -742,27 +783,18 @@ const App: React.FC = () => {
                                 className="absolute top-0 bottom-0 w-0.5 bg-white shadow-[0_0_15px_rgba(0,0,0,0.5)] cursor-ew-resize z-30 pointer-events-none"
                                 style={{ left: `${sliderPos * 100}%` }}
                             >
-                                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-9 h-9 bg-white rounded-full shadow-xl flex items-center justify-center">
-                                    <SplitSquareHorizontal size={18} className="text-slate-900" />
+                                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 md:w-9 md:h-9 bg-white rounded-full shadow-xl flex items-center justify-center border border-slate-100">
+                                    <SplitSquareHorizontal size={16} className="text-slate-900" />
                                 </div>
-                            </div>
-                            
-                            {/* Comparison Labels */}
-                            <div className="absolute top-1/2 left-4 md:left-8 -translate-y-1/2 bg-black/60 backdrop-blur text-white px-4 py-2 rounded-full text-sm font-bold pointer-events-none border border-white/10 shadow-xl z-20 select-none">
-                                After
-                            </div>
-                            <div className="absolute top-1/2 right-4 md:right-8 -translate-y-1/2 bg-black/60 backdrop-blur text-white px-4 py-2 rounded-full text-sm font-bold pointer-events-none border border-white/10 shadow-xl z-20 select-none">
-                                Before
                             </div>
                         </>
                     )}
-
                  </div>
             </div>
 
             {/* RESPONSIVE CONTROL DECK */}
-            <div className="fixed bottom-4 left-3 right-3 md:bottom-10 md:left-1/2 md:right-auto md:-translate-x-1/2 md:w-full md:max-w-3xl z-40">
-                <div className="bg-white/95 backdrop-blur-xl border border-white/40 rounded-3xl p-3 md:p-5 shadow-2xl shadow-indigo-900/10 flex flex-col gap-2 md:gap-4">
+            <div className="fixed bottom-2 left-2 right-2 md:bottom-10 md:left-1/2 md:right-auto md:-translate-x-1/2 md:w-full md:max-w-2xl z-40">
+                <div className="bg-white/95 backdrop-blur-xl border border-white/40 rounded-[2rem] p-3 md:p-5 shadow-2xl shadow-indigo-900/10 flex flex-col gap-2 md:gap-4">
                     
                     {/* Progress Bar */}
                     <div className="flex items-center gap-3 px-1">
@@ -773,20 +805,20 @@ const App: React.FC = () => {
 
                     {/* Buttons Grid */}
                     <div className="grid grid-cols-5 gap-2 items-center">
-                         {/* Left: Utility */}
+                         {/* Left: Mute */}
                          <div className="col-span-1 flex justify-start">
                             <button onClick={toggleMute} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl bg-slate-50 text-slate-500 hover:bg-slate-100 transition-colors active:scale-95">{isMuted ? <VolumeX size={18}/> : <Volume2 size={18}/>}</button>
                          </div>
                          
-                         {/* Center: Play */}
-                         <div className="col-span-3 flex justify-center gap-4">
-                            <button onClick={handleZoomReset} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50 hidden md:flex"><RotateCcw size={18}/></button>
+                         {/* Center: Play & Zoom */}
+                         <div className="col-span-3 flex justify-center gap-3">
+                            <button onClick={handleZoomReset} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50"><RotateCcw size={18}/></button>
 
-                            <button onClick={togglePlay} className="w-16 h-12 md:w-20 md:h-14 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-600/20 active:scale-95 transition-all">
+                            <button onClick={togglePlay} className="w-16 h-10 md:w-20 md:h-12 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-600/20 active:scale-95 transition-all">
                                 {mode === ProcessingMode.PLAYING ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" className="ml-1"/>}
                             </button>
 
-                            <button onClick={handleZoomIn} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50 hidden md:flex"><ZoomIn size={20}/></button>
+                            <button onClick={handleZoomIn} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center rounded-2xl text-slate-400 hover:bg-slate-50"><ZoomIn size={20}/></button>
                          </div>
 
                          {/* Right: Enhance Tools */}
